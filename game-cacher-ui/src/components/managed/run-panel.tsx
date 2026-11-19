@@ -25,7 +25,8 @@ export function RunPanel({ platformId, status, onChanged }: { platformId: string
       onChanged();
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {
-        toast.push({ variant: "info", message: "An update run is already running." });
+        // 409: already running, or the platform is disabled — the server says which.
+        toast.push({ variant: "info", message: errorMessage(e) });
         onChanged();
       } else {
         toast.push({ variant: "error", title: "Could not start run", message: errorMessage(e) });
