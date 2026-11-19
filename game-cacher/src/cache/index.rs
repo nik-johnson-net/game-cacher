@@ -270,6 +270,11 @@ impl LruIndex {
         self.notify_removed(&removed);
     }
 
+    /// Bytes recorded for one object (slices + meta), if indexed.
+    pub fn object_bytes(&self, object_prefix: &str) -> Option<u64> {
+        self.lock().objects.get(object_prefix).map(|e| e.bytes)
+    }
+
     pub fn usage(&self) -> Usage {
         let inner = self.lock();
         let mut usage = Usage {

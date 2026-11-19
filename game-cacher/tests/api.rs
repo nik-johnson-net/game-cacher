@@ -446,6 +446,31 @@ async fn managed_updates_flow() {
     assert_eq!(st["running"], false);
     assert_eq!(st["next_run"], Value::Null);
 
+    // Selection is trimmed and de-duplicated preserving order; no next_run while logged out.
+    let (_, st) = h
+        .send(
+            Method::PUT,
+            "/api/platforms/fake/managed/selection",
+            json!({"selected":["g2","g1"," g2 "]}),
+        )
+        .await;
+    assert_eq!(st["selected"], json!(["g2", "g1"]));
+    assert_eq!(st["next_run"], Value::Null, "login required first");
+
+    // Runs on a disabled platform are refused.
+    h.send(
+        Method::PUT,
+        "/api/platforms/fake",
+        json!({"enabled": false}),
+    )
+    .await;
+    let (s, _) = h
+        .send(Method::POST, "/api/platforms/fake/managed/run", Value::Null)
+        .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    h.send(Method::PUT, "/api/platforms/fake", json!({"enabled": true}))
+        .await;
+
     let (_, r) = h
         .send(
             Method::POST,

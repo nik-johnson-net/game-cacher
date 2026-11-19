@@ -53,9 +53,10 @@ export function AuthPanel({ platformId, status, onChanged }: AuthPanelProps) {
       case "pending":
         break; // keep waiting; the poll loop schedules the next check
       case "guard_required":
-        // "device" / "device_confirmation": approve on the phone and keep polling qr_poll.
+        // "email" / "device" (authenticator code): show the code form.
+        // "device_confirmation": approve on the phone and keep polling qr_poll.
         setStage(
-          res.guard_type === "email"
+          res.guard_type === "email" || res.guard_type === "device"
             ? { kind: "guard", challengeId: res.challenge_id, guardType: res.guard_type }
             : { kind: "device", challengeId: res.challenge_id },
         );

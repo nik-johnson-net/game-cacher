@@ -106,7 +106,16 @@ pub(crate) async fn handle(State(engine): State<Arc<CacheEngine>>, req: Request)
         .path_and_query()
         .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| "/".into());
+    // Only platform traffic is served: anything else (unknown hosts, IP literals)
+    // is refused so the cache can't be used as an open proxy into the LAN.
+    if host.parse::<std::net::IpAddr>().is_ok() || host.starts_with('[') {
+        return text(StatusCode::FORBIDDEN, "IP-literal hosts are not served");
+    }
     let platform = engine.platforms.identify(&host, ua_str).cloned();
+    if platform.is_none() {
+        engine.metrics.request("other", CacheResult::Bypass);
+        return text(StatusCode::FORBIDDEN, "host is not served by this cache");
+    }
     let label = platform.as_ref().map(|p| p.id()).unwrap_or("other");
     let cacheable = match &platform {
         Some(p) => is_cacheable(&engine, p, req.method(), &pq).await,

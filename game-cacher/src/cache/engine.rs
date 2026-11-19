@@ -560,11 +560,20 @@ impl CacheEngine {
     // ---------------------------------------------------------------------
 
     /// Builds a prefill target; the bool is false when the platform bypasses this path.
-    fn prefill_target(&self, identifier: &str, host: &str, pq: &str) -> Result<(Target, bool)> {
+    /// Disabled platforms are refused so nothing is cached for them.
+    async fn prefill_target(
+        &self,
+        identifier: &str,
+        host: &str,
+        pq: &str,
+    ) -> Result<(Target, bool)> {
         let platform = self
             .platforms
             .get(identifier)
             .ok_or_else(|| anyhow!("unknown platform {identifier}"))?;
+        if !self.settings.get().await.platform_enabled(identifier) {
+            bail!("platform {identifier} is disabled");
+        }
         let host = super::proxy::strip_port(host);
         let t = Target::new(identifier, &host, pq, None);
         let cacheable = platform.cache_policy(&t.key.path) == CachePolicy::Cache;
@@ -612,7 +621,7 @@ impl CacheEngine {
         pq: &str,
         range: Option<(u64, u64)>,
     ) -> Result<Bytes> {
-        let (t, cacheable) = self.prefill_target(identifier, host, pq)?;
+        let (t, cacheable) = self.prefill_target(identifier, host, pq).await?;
         if !cacheable {
             let resp = Self::send(self.upstream_get(&t, None)).await?;
             return read_uncached(resp, range).await;
@@ -661,14 +670,30 @@ async fn read_uncached(resp: reqwest::Response, range: Option<(u64, u64)>) -> Re
 #[async_trait]
 impl Prefill for CacheEngine {
     async fn warm(&self, identifier: &str, host: &str, path_and_query: &str) -> Result<WarmResult> {
-        let (t, cacheable) = self.prefill_target(identifier, host, path_and_query)?;
+        let (t, cacheable) = self
+            .prefill_target(identifier, host, path_and_query)
+            .await?;
         if !cacheable {
             log::debug!("prefill: {path_and_query} bypasses the cache, skipping warm");
             return Ok(WarmResult::default());
         }
         let mut r = WarmResult::default();
         let (meta, start) = match self.open(&t).await? {
-            Opened::Ready { meta, fresh: None } => (meta, 0),
+            Opened::Ready { meta, fresh: None } => {
+                // Fast path: the index says every slice was written, so skip
+                // per-slice existence checks (a verify pass over a large game
+                // would otherwise cost one storage HEAD per slice).
+                if self
+                    .index
+                    .object_bytes(&t.prefix)
+                    .is_some_and(|b| b >= meta.total_size)
+                {
+                    self.index.touch(&t.prefix, identifier);
+                    r.bytes_already_cached = meta.total_size;
+                    return Ok(r);
+                }
+                (meta, 0)
+            }
             Opened::Ready {
                 meta,
                 fresh: Some(f),
