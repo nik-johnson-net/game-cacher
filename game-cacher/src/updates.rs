@@ -17,9 +17,9 @@ use crate::platforms::{
 use crate::secrets::DynSecrets;
 use crate::settings::SettingsStore;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateRun {
-    pub started: Option<DateTime<Utc>>,
+    pub started: DateTime<Utc>,
     pub finished: Option<DateTime<Utc>>,
     pub games: Vec<UpdateReport>,
 }
@@ -98,7 +98,11 @@ impl UpdateManager {
         let settings = self.settings.get().await;
         let last_run = self.last_run(id).await?;
         let running = self.is_running(id);
-        let next_run = if settings.selected(id).is_empty() || !settings.platform_enabled(id) {
+        let auth = managed.auth_status(&self.ctx(id)).await?;
+        let next_run = if settings.selected(id).is_empty()
+            || !settings.platform_enabled(id)
+            || (auth.required && !auth.logged_in)
+        {
             None
         } else {
             Some(next_due(
@@ -107,7 +111,7 @@ impl UpdateManager {
             ))
         };
         Ok(ManagedStatus {
-            auth: managed.auth_status(&self.ctx(id)).await?,
+            auth,
             login_methods: managed.login_methods().to_vec(),
             selected: settings.selected(id),
             running,
@@ -141,7 +145,7 @@ impl UpdateManager {
         let selected = self.settings.get().await.selected(id);
         log::info!("managed update run for {id}: {} game(s)", selected.len());
         let mut run = UpdateRun {
-            started: Some(Utc::now()),
+            started: Utc::now(),
             finished: None,
             games: vec![],
         };
@@ -237,8 +241,8 @@ impl UpdateManager {
 
 /// Next scheduled run: `interval` after the last run started; now if never run.
 fn next_due(last: Option<&UpdateRun>, interval_minutes: u32) -> DateTime<Utc> {
-    match last.and_then(|r| r.started) {
-        Some(started) => started + chrono::Duration::minutes(interval_minutes as i64),
+    match last {
+        Some(r) => r.started + chrono::Duration::minutes(interval_minutes as i64),
         None => Utc::now(),
     }
 }
@@ -252,8 +256,9 @@ mod tests {
         let now = Utc::now();
         assert!(next_due(None, 60) <= Utc::now());
         let run = UpdateRun {
-            started: Some(now),
-            ..Default::default()
+            started: now,
+            finished: None,
+            games: vec![],
         };
         assert_eq!(
             next_due(Some(&run), 60),

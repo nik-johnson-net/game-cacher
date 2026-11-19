@@ -50,6 +50,7 @@ RUN mkdir -p /data
 VOLUME /data
 # 53 DNS (udp+tcp), 80 cache HTTP, 443 SNI passthrough, 8080 admin UI/API/metrics.
 EXPOSE 53/udp 53/tcp 80 443 8080
-ENV GC_STORAGE_PATH=/data GC_UI_PATH=/opt/game-cacher/ui
-HEALTHCHECK --interval=30s --timeout=5s CMD curl -fsS http://127.0.0.1:8080/healthz || exit 1
+ENV GC_STORAGE_PATH=/data GC_UI_PATH=/opt/game-cacher/ui GC_ADMIN_LISTEN=0.0.0.0:8080
+# Follows GC_ADMIN_LISTEN's port. (Ignored when podman builds OCI-format images.)
+HEALTHCHECK --interval=30s --timeout=5s CMD curl -fsS "http://127.0.0.1:${GC_ADMIN_LISTEN##*:}/healthz" || exit 1
 ENTRYPOINT [ "/opt/game-cacher/bin/game-cacher" ]

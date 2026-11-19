@@ -91,7 +91,8 @@ pub async fn selection(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    selected.dedup();
+    let mut seen = std::collections::HashSet::new();
+    selected.retain(|s| seen.insert(s.clone()));
     state
         .settings
         .update(|s| {
@@ -106,6 +107,9 @@ pub async fn run(
     Path(id): Path<String>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let p = managed(&state, &id)?;
+    if !state.settings.get().await.platform_enabled(&id) {
+        return Err(ApiError::conflict(format!("{id} is disabled")));
+    }
     match state.updates.run_now(p) {
         Ok(()) => Ok((StatusCode::ACCEPTED, Json(json!({ "started": true })))),
         Err(e) if e.downcast_ref::<AlreadyRunning>().is_some() => {

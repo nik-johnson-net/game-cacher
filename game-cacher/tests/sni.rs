@@ -54,9 +54,9 @@ async fn splices_to_upstream_and_echoes() {
     let upstream = Upstream::new(Arc::new(StaticResolver(LOCALHOST)), 80, "test".into()).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    sni::spawn(listener, upstream, port, metrics.clone());
+    sni::spawn(listener, upstream, port, platforms(), metrics.clone());
 
-    let hello = client_hello("cdn.example.com");
+    let hello = client_hello("cdn1.epicgames.com");
     let mut c = TcpStream::connect(addr).await.unwrap();
     c.write_all(&hello).await.unwrap();
     c.write_all(b"payload-bytes").await.unwrap();
@@ -89,10 +89,12 @@ async fn loop_is_detected_and_closed() {
     let upstream = Upstream::new(Arc::new(guard), 80, "test".into()).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    sni::spawn(listener, upstream, 9, metrics.clone());
+    sni::spawn(listener, upstream, 9, platforms(), metrics.clone());
 
     let mut c = TcpStream::connect(addr).await.unwrap();
-    c.write_all(&client_hello("cdn.example.com")).await.unwrap();
+    c.write_all(&client_hello("cdn1.epicgames.com"))
+        .await
+        .unwrap();
     let mut buf = [0u8; 16];
     let n = tokio::time::timeout(Duration::from_secs(5), c.read(&mut buf))
         .await
@@ -112,7 +114,7 @@ async fn garbage_is_closed_as_error() {
     let upstream = Upstream::new(Arc::new(StaticResolver(LOCALHOST)), 80, "test".into()).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    sni::spawn(listener, upstream, 9, metrics.clone());
+    sni::spawn(listener, upstream, 9, platforms(), metrics.clone());
 
     let mut c = TcpStream::connect(addr).await.unwrap();
     c.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
@@ -126,5 +128,36 @@ async fn garbage_is_closed_as_error() {
         metrics
             .encode()
             .contains(r#"gamecacher_sni_connections_total{result="error"}"#)
+    );
+}
+
+fn platforms() -> Arc<game_cacher::platforms::Platforms> {
+    Arc::new(game_cacher::platforms::Platforms::new(
+        game_cacher::platforms::all(),
+    ))
+}
+
+#[tokio::test]
+async fn non_platform_names_are_rejected() {
+    let metrics = Metrics::new();
+    let upstream = Upstream::new(Arc::new(StaticResolver(LOCALHOST)), 80, "test".into()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    sni::spawn(listener, upstream, 9, platforms(), metrics.clone());
+    for name in ["internal.example.com", "10.0.0.5"] {
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(&client_hello(name)).await.unwrap();
+        let mut buf = [0u8; 16];
+        let n = tokio::time::timeout(Duration::from_secs(5), c.read(&mut buf))
+            .await
+            .unwrap()
+            .unwrap_or(0);
+        assert_eq!(n, 0, "{name}");
+    }
+    let text = metrics.encode();
+    assert!(
+        // rustls omits SNI for IP addresses, so that one counts as an error; both are refused.
+        text.contains(r#"gamecacher_sni_connections_total{result="rejected"} 1"#),
+        "{text}"
     );
 }

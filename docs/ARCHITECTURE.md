@@ -39,13 +39,13 @@ game-cacher/src/
   secrets/{mod,storage,vault}.rs      SecretStore trait + impls
   settings.rs              SettingsStore: settings.json + state/<platform>.json
   upstream.rs              Upstream DNS resolver (hickory) + reqwest client factory
-  cache/{mod,key,engine,proxy,index}.rs  caching engine, HTTP proxy handler, LRU index/eviction
+  cache/{mod,key,meta,range,engine,proxy,index}.rs  caching engine, HTTP proxy handler, LRU index/eviction
   dns.rs                   DNS server
   sni.rs                   SNI passthrough
   metrics.rs               prometheus-client registry + typed metric families
   platforms/{mod,domains,steam/,epic/,blizzard/,origin,windows_update}.rs
   updates.rs               managed-update scheduler + job runner
-  api/{mod,auth,platforms,managed,stats,settings,cache}.rs
+  api/{mod,auth,platforms,managed,status,settings}.rs
 game-cacher/tests/         integration tests (real listeners + reqwest)
 game-cacher-ui/            React 19 + Vite + Tailwind 4
 docker/Dockerfile          multi-stage UBI10 image
@@ -121,7 +121,8 @@ Unknown/missing platforms default to enabled; missing `managed` entries default 
 1. **Identifier**: first platform whose `matches_user_agent(ua)` is true (Steam:
    `Valve/Steam HTTP Client 1.0`), else first platform whose domain list
    matches the Host (`*.x.com` matches subdomains only, not the apex). No
-   match → plain proxy, not cached.
+   match, or an IP-literal Host → 403 (the cache is not an open proxy). The SNI
+   listener likewise only relays names matching a platform domain.
 2. Platform **disabled** → plain proxy, not cached (DNS also stops overriding it).
 3. Only `GET`/`HEAD` with upstream 200/206 are cached. Other methods/statuses are
    proxied verbatim. `?nocache=...` bypasses the cache. `Platform::cache_policy(path)`
@@ -156,13 +157,17 @@ Domain lists come from uklans/cache-domains (`platforms/domains.rs`).
 `list_games`, `update_game(game_id) -> UpdateReport`. Platforms fetch content
 through the `Prefill` handle, which runs the request through the cache
 engine in-process (with the platform identifier), so later LAN clients hit.
+Every run re-enumerates the selected games' content and warms it, which
+verifies it against the cache: unchanged content costs only in-memory index
+lookups, and anything evicted or purged is downloaded again (`updated: true`
+with `bytes_downloaded > 0`). Prefill and runs are refused for disabled platforms.
 
 | Platform | Login | Games list | Update check | Prefill |
 |---|---|---|---|---|
 | Steam | QR or password+Guard (CM via steam-vent), refresh token in secrets | licenses → PICS | PICS buildid / manifest gid per depot | manifest → `/depot/<id>/chunk/<sha>` |
 | Epic | auth code paste (legendary flow), refresh token in secrets | launcher assets | buildVersion | manifest → ChunksV4 paths |
 | Blizzard | none | fixed product catalog (wow, wow_classic, pro, d3, hs, s2, hero, fenris, ...) | `versions` BuildConfig hash | build/cdn config, encoding, archive indexes + archives |
-| Windows Update | none | user-entered URLs | always (HEAD/size) | GET each URL |
+| Windows Update | none | user-entered URLs | every run (warm reports cached vs downloaded) | GET each URL |
 | Origin | passive only | — | — | — |
 
 ### Platform state documents (`state/<platform>.json`)
@@ -232,5 +237,5 @@ UpdateReport = { game_id, name, previous_version, current_version, updated: bool
 - `storage_used_bytes{platform}` / `storage_objects{platform}` gauge, `storage_max_bytes` gauge
 - `evictions_total{platform}` counter
 - `dns_queries_total{result=override|forward|refused|error}` counter
-- `sni_connections_total{result=ok|error|loop}` counter, `sni_active_connections` gauge
+- `sni_connections_total{result=ok|error|loop|rejected}` counter, `sni_active_connections` gauge
 - `managed_update_runs_total{platform,result=ok|error}`, `managed_update_bytes_total{platform}` counters

@@ -9,6 +9,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::metrics::Metrics;
+use crate::platforms::Platforms;
 use crate::upstream::{LoopDetected, Upstream};
 
 const MAX_HELLO: usize = 16 * 1024;
@@ -16,10 +17,13 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Serves passthrough connections from `listener` to `<sni>:<upstream_port>` (443 in production).
+/// Only names owned by a platform are relayed, so the listener can't be used as an
+/// open TCP relay into the LAN (IP literals never match a platform domain).
 pub fn spawn(
     listener: TcpListener,
     upstream: Upstream,
     upstream_port: u16,
+    platforms: Arc<Platforms>,
     metrics: Arc<Metrics>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -34,8 +38,10 @@ pub fn spawn(
             };
             let upstream = upstream.clone();
             let metrics = metrics.clone();
+            let platforms = platforms.clone();
             tokio::spawn(async move {
-                if let Err(e) = handle(stream, &upstream, upstream_port, &metrics).await {
+                if let Err(e) = handle(stream, &upstream, upstream_port, &platforms, &metrics).await
+                {
                     log::debug!("sni connection from {peer}: {e:#}");
                 }
             });
@@ -47,6 +53,7 @@ async fn handle(
     mut client: TcpStream,
     upstream: &Upstream,
     port: u16,
+    platforms: &Platforms,
     metrics: &Metrics,
 ) -> Result<()> {
     let (buf, host) = match tokio::time::timeout(HELLO_TIMEOUT, read_hello(&mut client)).await {
@@ -60,6 +67,10 @@ async fn handle(
             return Err(anyhow!("timed out waiting for ClientHello"));
         }
     };
+    if platforms.by_host(&host).is_none() {
+        metrics.sni_connection("rejected");
+        return Err(anyhow!("{host} is not a platform domain"));
+    }
     let ips = match upstream.resolve(&host).await {
         Ok(ips) if !ips.is_empty() => ips,
         Ok(_) => {

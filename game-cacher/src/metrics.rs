@@ -215,7 +215,7 @@ impl Metrics {
         self.dns_queries.get_or_create(&r(result)).inc();
     }
 
-    /// `result`: ok | error | loop
+    /// `result`: ok | error | loop | rejected
     pub fn sni_connection(&self, result: &str) {
         self.sni_connections.get_or_create(&r(result)).inc();
     }

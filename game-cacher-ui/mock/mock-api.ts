@@ -268,7 +268,11 @@ function login(platformId: string, m: Managed, req: LoginRequest): LoginResponse
     case "password": {
       if (!req.username || req.password === "wrong") return { status: "failed", message: "invalid username or password" };
       const id = `pw-${++challengeSeq}`;
-      // Usernames starting with "phone" use device confirmation, anything else asks for an emailed code.
+      // "phone…" → device confirmation, "totp…" → authenticator code, anything else → emailed code.
+      if (req.username.startsWith("totp")) {
+        challenges.set(id, { platform: platformId, polls: 0, kind: "qr", account: req.username });
+        return { status: "guard_required", challenge_id: id, guard_type: "device" };
+      }
       if (req.username.startsWith("phone")) {
         challenges.set(id, { platform: platformId, polls: 0, kind: "device", account: req.username });
         return { status: "guard_required", challenge_id: id, guard_type: "device_confirmation" };

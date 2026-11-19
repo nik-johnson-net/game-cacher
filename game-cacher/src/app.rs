@@ -150,6 +150,7 @@ pub async fn start(config: Config, env: EnvSecrets, o: Overrides) -> Result<Runn
             l,
             upstream.clone(),
             o.sni_upstream_port.unwrap_or(443),
+            platforms.clone(),
             metrics.clone(),
         ));
         log::info!("SNI passthrough listening on {addr}");

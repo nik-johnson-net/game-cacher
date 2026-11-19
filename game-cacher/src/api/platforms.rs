@@ -122,11 +122,7 @@ pub async fn purge(
         .get(p.id())
         .cloned()
         .unwrap_or_default();
-    let (_, freed_bytes) = state
-        .storage
-        .delete_prefix(&format!("cache/{}/", p.id()))
-        .await?;
-    state.index.remove_identifier(p.id());
+    let (_, freed_bytes) = state.engine.purge(p.id()).await?;
     log::info!(
         "purged {id} cache: {} objects, {freed_bytes} bytes",
         before.objects

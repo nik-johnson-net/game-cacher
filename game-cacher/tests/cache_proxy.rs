@@ -452,8 +452,13 @@ async fn not_found_passthrough() {
 #[tokio::test]
 async fn bypass_cases() {
     let h = harness().await;
-    // Unknown host.
-    let (s, cache, body) = h.fetch("example.com", "/obj/1000", None).await;
+    // Unknown hosts and IP literals are refused (no open proxy).
+    let (s, _, _) = h.fetch("example.com", "/obj/1000", None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _, _) = h.fetch("10.0.0.5", "/obj/1000", None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    // Platform host with ?nocache is proxied uncached.
+    let (s, cache, body) = h.fetch(EPIC, "/obj/1000?nocache=1", None).await;
     assert_eq!(
         (s, cache.as_str(), body),
         (StatusCode::OK, "BYPASS", Bytes::from(data(1000)))
@@ -525,7 +530,7 @@ async fn loop_detection() {
     .await;
     let (s, _, _) = h.fetch(EPIC, "/obj/1000", None).await;
     assert_eq!(s, StatusCode::LOOP_DETECTED);
-    let (s, _, _) = h.fetch("example.com", "/obj/1000", None).await;
+    let (s, _, _) = h.fetch(EPIC, "/obj/1000?nocache=1", None).await;
     assert_eq!(s, StatusCode::LOOP_DETECTED);
 }
 
@@ -538,7 +543,7 @@ async fn dead_upstream_is_502() {
     .await;
     let (s, _, _) = h.fetch(EPIC, "/obj/1000", None).await;
     assert_eq!(s, StatusCode::BAD_GATEWAY);
-    let (s, _, _) = h.fetch("example.com", "/obj/1000", None).await;
+    let (s, _, _) = h.fetch(EPIC, "/obj/1000?nocache=1", None).await;
     assert_eq!(s, StatusCode::BAD_GATEWAY);
 }
 
