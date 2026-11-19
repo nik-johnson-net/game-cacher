@@ -39,6 +39,8 @@ impl SecretStore for MemSecrets {
 struct MockPrefill {
     manifest: Bytes,
     fail_containing: Option<String>,
+    /// When set, warm reports everything as already cached.
+    cached: std::sync::atomic::AtomicBool,
     warms: Mutex<Vec<(String, String, String)>>,
     gets: Mutex<Vec<(String, String, String)>>,
 }
@@ -57,9 +59,17 @@ impl Prefill for MockPrefill {
         {
             bail!("boom");
         }
-        Ok(WarmResult {
-            bytes_downloaded: 10,
-            bytes_already_cached: 1,
+        let cached = self.cached.load(std::sync::atomic::Ordering::SeqCst);
+        Ok(if cached {
+            WarmResult {
+                bytes_downloaded: 0,
+                bytes_already_cached: 10,
+            }
+        } else {
+            WarmResult {
+                bytes_downloaded: 10,
+                bytes_already_cached: 1,
+            }
         })
     }
     async fn get(&self, id: &str, host: &str, pq: &str) -> Result<Bytes> {
@@ -345,7 +355,7 @@ async fn mount_manifest_list(f: &Fixture) {
                  "queryParams": [{"name": "f_token", "value": "a b"}]}
             ]
         }]})))
-        .expect(1)
+        .expect(1..)
         .mount(&f.server)
         .await;
 }
@@ -407,11 +417,28 @@ async fn update_game_warms_every_chunk_then_noops() {
             .all(|w| w.0 == "epic" && w.1 == "download.epicgames.com")
     );
 
-    // Same buildVersion again: nothing to do (manifest list mock expects exactly 1 call).
+    // Same buildVersion again, content cached: re-verified, not an update.
+    f.prefill
+        .cached
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     let r2 = f.epic.update_game(&f.ctx, "Sugar").await.unwrap();
-    assert!(!r2.updated && r2.error.is_none());
+    assert!(r2.error.is_none());
     assert_eq!(r2.previous_version.as_deref(), Some("1.0.0"));
-    assert_eq!(f.prefill.warms.lock().unwrap().len(), 3);
+    assert!(!r2.updated);
+    assert_eq!(
+        (r2.files, r2.bytes_downloaded, r2.bytes_already_cached),
+        (3, 0, 30)
+    );
+    assert_eq!(f.prefill.warms.lock().unwrap().len(), 6);
+    assert_eq!(f.prefill.gets.lock().unwrap().len(), 2);
+
+    // Chunks evicted since: same build, but bytes had to be re-downloaded (repair).
+    f.prefill
+        .cached
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let r3 = f.epic.update_game(&f.ctx, "Sugar").await.unwrap();
+    assert!(r3.updated && r3.error.is_none());
+    assert_eq!(r3.bytes_downloaded, 30);
 }
 
 #[tokio::test]
