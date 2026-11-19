@@ -1,11 +1,31 @@
-//! Epic Games Store: passive caching; managed updates TODO(T10).
-use super::{Platform, domains};
+//! Epic Games Store: passive caching plus managed updates (auth-code login,
+//! launcher assets, manifest-driven chunk prefill).
+use tokio::sync::Mutex;
 
-pub struct Epic {}
+use super::{ManagedUpdates, Platform, domains};
+
+mod client;
+mod managed;
+mod manifest;
+
+pub use client::Endpoints;
+
+pub struct Epic {
+    endpoints: Endpoints,
+    token: Mutex<Option<managed::CachedToken>>,
+}
 
 impl Epic {
     pub fn new() -> Self {
-        Self {}
+        Self::with_endpoints(Endpoints::default())
+    }
+
+    /// Custom API base URLs (scheme + host), used by tests.
+    pub fn with_endpoints(endpoints: Endpoints) -> Self {
+        Self {
+            endpoints,
+            token: Mutex::new(None),
+        }
     }
 }
 
@@ -27,5 +47,8 @@ impl Platform for Epic {
     }
     fn domains(&self) -> &'static [&'static str] {
         domains::EPIC
+    }
+    fn managed(&self) -> Option<&dyn ManagedUpdates> {
+        Some(self)
     }
 }
