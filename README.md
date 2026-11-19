@@ -71,6 +71,7 @@ list; `docs/ARCHITECTURE.md` has the table. The most common ones:
 | `GC_SLICE_SIZE` | `1MiB` | Cache slice size for new objects |
 | `GC_ADMIN_PASSWORD` | — (required) | Web UI / API password (or `GC_DISABLE_AUTH=true`) |
 | `GC_DISABLE_DNS` / `GC_DISABLE_SNI` | false | Turn off DNS or SNI if you run your own |
+| `GC_ALLOW_PRIVATE_UPSTREAM` | false | Allow upstream hosts that resolve to private/loopback addresses (e.g. a local mirror). Off by default so the cache can't be used to reach into your LAN |
 | `LOG` | `info` | Log filter (`debug`, `game_cacher=debug`, ...) |
 
 The API accepts `Authorization: Bearer $GC_ADMIN_PASSWORD` for scripting.

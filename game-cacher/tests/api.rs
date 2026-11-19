@@ -602,6 +602,37 @@ async fn scheduler_runs_selected_games() {
 }
 
 #[tokio::test]
+async fn windows_update_selection_is_validated() {
+    let h = Harness::new(&[], Duration::from_secs(3600)).await;
+    let path = "/api/platforms/windowsupdate/managed/selection";
+    let good = "http://download.windowsupdate.com/d/msdownload/update/x.cab";
+    let (s, st) = h
+        .send(reqwest::Method::PUT, path, json!({ "selected": [good] }))
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(st["selected"], json!([good]));
+    for bad in [
+        "http://example.com/x.cab",
+        "ftp://download.windowsupdate.com/x",
+        "not a url",
+    ] {
+        let (s, body) = h
+            .send(
+                reqwest::Method::PUT,
+                path,
+                json!({ "selected": [good, bad] }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}");
+        assert!(body["error"].is_string(), "{body}");
+    }
+    // The previous valid selection is unchanged.
+    let (_, st) = h.get("/api/platforms/windowsupdate/managed").await;
+    assert_eq!(st["selected"], json!([good]));
+    h.app.shutdown().await;
+}
+
+#[tokio::test]
 async fn settings_and_ui_fallback() {
     let ui = tempfile::tempdir().unwrap();
     std::fs::write(ui.path().join("index.html"), "<html>gc</html>").unwrap();

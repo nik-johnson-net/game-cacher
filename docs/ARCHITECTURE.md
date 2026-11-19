@@ -127,7 +127,9 @@ Unknown/missing platforms default to enabled; missing `managed` entries default 
    only by user agent (Steam CDN hosts) are cache-only: GET/HEAD while the
    platform is enabled, otherwise 403. Upstream names resolving only to
    private/loopback/link-local addresses are refused unless
-   `--allow-private-upstream`. The SNI listener only relays names matching a
+   `--allow-private-upstream`; redirects to IP-literal targets are checked the
+   same way (and refused if they point at a cache IP). Objects claiming more
+   than 1 TiB are refused (502). The SNI listener only relays names matching a
    platform domain.
 2. Platform **disabled** → plain proxy, not cached (DNS also stops overriding it).
 3. Only `GET`/`HEAD` with upstream 200/206 are cached. Other methods/statuses are
@@ -212,8 +214,8 @@ Errors: `{"error": "message"}` with appropriate status.
 | POST | `/api/platforms/{id}/managed/login` | `LoginRequest` → `LoginResponse` |
 | POST | `/api/platforms/{id}/managed/logout` | 204 |
 | GET | `/api/platforms/{id}/managed/games` | `[Game]` |
-| PUT | `/api/platforms/{id}/managed/selection` | `{"selected":[game_id]}` → `ManagedStatus` |
-| POST | `/api/platforms/{id}/managed/run` | start update run now → 202 `{"started": true}` (409 if running) |
+| PUT | `/api/platforms/{id}/managed/selection` | `{"selected":[game_id]}` → `ManagedStatus` (400 if the platform rejects an entry, e.g. a non-WU URL) |
+| POST | `/api/platforms/{id}/managed/run` | start update run now → 202 `{"started": true}` (409 if running or the platform is disabled) |
 | GET | `/api/settings` | `{"update_interval_minutes"}` |
 | PUT | `/api/settings` | `{"update_interval_minutes"}` → same |
 
