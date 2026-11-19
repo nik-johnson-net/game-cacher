@@ -79,7 +79,10 @@ impl UpdateManager {
     }
 
     pub fn is_running(&self, platform_id: &str) -> bool {
-        self.running.lock().unwrap().contains(platform_id)
+        self.running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(platform_id)
     }
 
     pub async fn last_run(&self, platform_id: &str) -> Result<Option<UpdateRun>> {
@@ -123,15 +126,21 @@ impl UpdateManager {
     /// Starts a run in the background. Errors with `AlreadyRunning` if one is active.
     pub fn run_now(self: &Arc<Self>, platform: DynPlatform) -> Result<()> {
         let id = platform.id().to_string();
-        if !self.running.lock().unwrap().insert(id.clone()) {
+        if !self
+            .running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.clone())
+        {
             return Err(AlreadyRunning.into());
         }
         let this = self.clone();
         tokio::spawn(async move {
+            // Clears the running flag even if the run panics.
+            let _guard = RunningGuard(this.clone(), id.clone());
             if let Err(e) = this.run(&platform).await {
                 log::error!("managed update run for {id} failed: {e:#}");
             }
-            this.running.lock().unwrap().remove(&id);
         });
         Ok(())
     }
@@ -238,6 +247,18 @@ impl UpdateManager {
                 this.tick().await;
             }
         })
+    }
+}
+
+struct RunningGuard(Arc<UpdateManager>, String);
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        self.0
+            .running
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.1);
     }
 }
 

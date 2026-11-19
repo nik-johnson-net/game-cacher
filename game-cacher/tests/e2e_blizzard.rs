@@ -197,6 +197,7 @@ impl Harness {
             "127.0.0.1:0",
             "--admin-listen",
             "127.0.0.1:0",
+            "--allow-private-upstream",
             "--cache-ip",
             "10.99.0.1",
             "--slice-size",
@@ -350,27 +351,35 @@ async fn blizzard_prefill_verify_and_repair() {
 }
 
 #[tokio::test]
-async fn windows_update_prefill_and_foreign_host_error() {
+async fn windows_update_prefill_and_foreign_host_rejected() {
     let h = Harness::new().await;
     let good = format!("http://{WU_HOST}/d/msdownload/update/x.cab");
     let foreign = "http://example.com/x.cab";
-    h.select("windowsupdate", &[&good, foreign]).await;
 
+    // A foreign host is rejected when the selection is saved.
+    let r = h
+        .client
+        .put(h.url("/api/platforms/windowsupdate/managed/selection"))
+        .bearer_auth(PW)
+        .json(&json!({ "selected": [&good, foreign] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::BAD_REQUEST);
+    let err: Value = r.json().await.unwrap();
+    assert!(
+        err["error"].as_str().unwrap().contains("example.com"),
+        "{err}"
+    );
+
+    h.select("windowsupdate", &[&good]).await;
     let games = h.run("windowsupdate").await;
-    let by_id = |id: &str| games.iter().find(|g| g["game_id"] == id).unwrap();
-    let ok = by_id(&good);
+    assert_eq!(games.len(), 1);
+    let ok = &games[0];
+    assert_eq!(ok["game_id"], good.as_str());
     assert_eq!(ok["error"], Value::Null, "{ok}");
     assert_eq!(ok["updated"], true);
     assert_eq!(ok["bytes_downloaded"], 90_000);
-    let bad = by_id(foreign);
-    assert!(
-        bad["error"]
-            .as_str()
-            .unwrap()
-            .contains("not a Windows Update"),
-        "{bad}"
-    );
-    assert_eq!(bad["updated"], false);
 
     h.assert_hit(WU_HOST, "/d/msdownload/update/x.cab", 90_000)
         .await;

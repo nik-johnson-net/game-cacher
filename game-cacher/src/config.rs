@@ -93,6 +93,11 @@ pub struct Config {
     #[arg(long, env = "GC_INSTANCE_ID")]
     pub instance_id: Option<String>,
 
+    /// Allow upstream CDN hosts that resolve to private/loopback addresses
+    /// (e.g. a local mirror). Off by default so the proxy can't reach into the LAN.
+    #[arg(long, env = "GC_ALLOW_PRIVATE_UPSTREAM", default_value_t = false)]
+    pub allow_private_upstream: bool,
+
     /// Port used for upstream HTTP fetches. Only changed by tests.
     #[arg(long, env = "GC_UPSTREAM_HTTP_PORT", default_value_t = 80, hide = true)]
     pub upstream_http_port: u16,

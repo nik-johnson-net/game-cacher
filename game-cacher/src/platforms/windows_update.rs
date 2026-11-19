@@ -135,6 +135,13 @@ impl ManagedUpdates for WindowsUpdate {
             .collect())
     }
 
+    fn validate_selection(&self, ids: &[String]) -> Result<()> {
+        for id in ids {
+            parse_target(id).map_err(|e| anyhow::anyhow!("{id}: {e}"))?;
+        }
+        Ok(())
+    }
+
     async fn update_game(&self, ctx: &PlatformCtx, game_id: &str) -> Result<UpdateReport> {
         let mut report = UpdateReport {
             game_id: game_id.to_string(),

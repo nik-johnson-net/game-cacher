@@ -52,5 +52,5 @@ VOLUME /data
 EXPOSE 53/udp 53/tcp 80 443 8080
 ENV GC_STORAGE_PATH=/data GC_UI_PATH=/opt/game-cacher/ui GC_ADMIN_LISTEN=0.0.0.0:8080
 # Follows GC_ADMIN_LISTEN's port. (Ignored when podman builds OCI-format images.)
-HEALTHCHECK --interval=30s --timeout=5s CMD curl -fsS "http://127.0.0.1:${GC_ADMIN_LISTEN##*:}/healthz" || exit 1
+HEALTHCHECK --interval=30s --timeout=5s CMD h="${GC_ADMIN_LISTEN%:*}"; [ "$h" = "0.0.0.0" ] && h=127.0.0.1; curl -fsS "http://$h:${GC_ADMIN_LISTEN##*:}/healthz" || exit 1
 ENTRYPOINT [ "/opt/game-cacher/bin/game-cacher" ]

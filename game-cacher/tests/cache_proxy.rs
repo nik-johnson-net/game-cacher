@@ -564,6 +564,47 @@ async fn steam_user_agent_on_any_host() {
 }
 
 #[tokio::test]
+async fn steam_user_agent_is_not_an_open_relay() {
+    let h = harness().await;
+    // IP literals in URL-parser spellings, and URL-altering characters.
+    for host in ["127.0.0.1/", "0x7f.1", "2130706433", "evil.com@127.0.0.1"] {
+        let resp = h
+            .get(host, "/obj/1000")
+            .header("user-agent", STEAM_UA)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{host}");
+    }
+    // Non-GET with the Steam UA on a non-platform host is never relayed.
+    let resp = h
+        .req(reqwest::Method::POST, "lancache.example.net", "/echo")
+        .header("user-agent", STEAM_UA)
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // Same when Steam is disabled: UA-only traffic isn't passed through.
+    h.settings
+        .update(|s| {
+            s.platforms.insert(
+                "steam".into(),
+                game_cacher::settings::PlatformSettings { enabled: false },
+            );
+        })
+        .await
+        .unwrap();
+    let resp = h
+        .get("lancache.example.net", "/obj/1000")
+        .header("user-agent", STEAM_UA)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn etag_hidden_for_blizzard_only() {
     let h = harness().await;
     for _ in 0..2 {

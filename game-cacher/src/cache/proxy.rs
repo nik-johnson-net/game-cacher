@@ -43,6 +43,16 @@ pub(crate) fn strip_port(host: &str) -> String {
     bare.trim_end_matches('.').to_ascii_lowercase()
 }
 
+/// True for a plain DNS name: rejects IP literals in every form the URL parser
+/// accepts (`10.0.0.1`, `0x7f.1`, `3232235777`, `[::1]`) and anything with
+/// characters that would change the URL (`/`, `@`, `?`, `#`).
+pub(crate) fn is_domain_name(host: &str) -> bool {
+    host.split('.').all(|l| {
+        !l.is_empty() && l.len() <= 63 && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    }) && host.len() <= 253
+        && matches!(url::Host::parse(host), Ok(url::Host::Domain(_)))
+}
+
 fn request_host(req: &Request) -> Option<String> {
     let raw = match req.headers().get(HOST) {
         Some(h) => h.to_str().ok()?.to_string(),
@@ -106,21 +116,28 @@ pub(crate) async fn handle(State(engine): State<Arc<CacheEngine>>, req: Request)
         .path_and_query()
         .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| "/".into());
-    // Only platform traffic is served: anything else (unknown hosts, IP literals)
-    // is refused so the cache can't be used as an open proxy into the LAN.
-    if host.parse::<std::net::IpAddr>().is_ok() || host.starts_with('[') {
-        return text(StatusCode::FORBIDDEN, "IP-literal hosts are not served");
+    // Only platform traffic is served: anything else (unknown hosts, IP literals in
+    // any spelling) is refused so the cache can't be used as an open proxy.
+    if !is_domain_name(&host) {
+        return text(StatusCode::FORBIDDEN, "only DNS host names are served");
     }
     let platform = engine.platforms.identify(&host, ua_str).cloned();
     if platform.is_none() {
         engine.metrics.request("other", CacheResult::Bypass);
         return text(StatusCode::FORBIDDEN, "host is not served by this cache");
     }
+    // Identified by user agent alone (Steam CDN hosts aren't enumerable): serve from
+    // the cache only, never relay other methods or disabled-platform traffic.
+    let by_ua_only = engine.platforms.by_host(&host).is_none();
     let label = platform.as_ref().map(|p| p.id()).unwrap_or("other");
     let cacheable = match &platform {
         Some(p) => is_cacheable(&engine, p, req.method(), &pq).await,
         None => false,
     };
+    if by_ua_only && !cacheable {
+        engine.metrics.request(label, CacheResult::Bypass);
+        return text(StatusCode::FORBIDDEN, "not cacheable for this host");
+    }
     match platform {
         Some(p) if cacheable => {
             let head = req.method() == Method::HEAD;
@@ -413,6 +430,32 @@ fn full_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn domain_names() {
+        for ok in [
+            "cdn1.epicgames.com",
+            "cache5-fra1.steamcontent.com",
+            "localhost",
+        ] {
+            assert!(is_domain_name(ok), "{ok}");
+        }
+        for bad in [
+            "10.0.0.1",
+            "0x7f.1",
+            "3232235777",
+            "::1",
+            "192.168.1.1/",
+            "a@b.com",
+            "x.com?y",
+            "x..com",
+            "",
+            "under_score.com",
+            "127.1",
+        ] {
+            assert!(!is_domain_name(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn hosts() {

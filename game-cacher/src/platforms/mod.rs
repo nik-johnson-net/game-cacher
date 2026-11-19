@@ -207,6 +207,11 @@ pub trait ManagedUpdates: Send + Sync {
     /// `ctx.prefill`. Must be idempotent: re-running with nothing new is cheap.
     /// Errors for a single game should be reported in `UpdateReport::error`.
     async fn update_game(&self, ctx: &PlatformCtx, game_id: &str) -> Result<UpdateReport>;
+    /// Rejects an invalid selection before it is saved (e.g. malformed URLs for
+    /// manual-list platforms). The error message is shown to the user.
+    fn validate_selection(&self, _ids: &[String]) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// True if `host` matches the pattern (`*.x.com` matches subdomains, not the apex).

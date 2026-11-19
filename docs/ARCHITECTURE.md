@@ -78,6 +78,7 @@ docker/Dockerfile          multi-stage UBI10 image
 | admin password | `GC_ADMIN_PASSWORD` | env only; required unless `--disable-auth` |
 | `--disable-auth` | `GC_DISABLE_AUTH` | false |
 | `--instance-id` (loop detection) | `GC_INSTANCE_ID` | hostname |
+| `--allow-private-upstream` | `GC_ALLOW_PRIVATE_UPSTREAM` | false |
 | hidden: `--upstream-http-port` | `GC_UPSTREAM_HTTP_PORT` | 80 (tests point it at a local server) |
 | log filter | `LOG` | `info` |
 
@@ -122,8 +123,13 @@ Unknown/missing platforms default to enabled; missing `managed` entries default 
 1. **Identifier**: first platform whose `matches_user_agent(ua)` is true (Steam:
    `Valve/Steam HTTP Client 1.0`), else first platform whose domain list
    matches the Host (`*.x.com` matches subdomains only, not the apex). No
-   match, or an IP-literal Host → 403 (the cache is not an open proxy). The SNI
-   listener likewise only relays names matching a platform domain.
+   match, or a Host that isn't a plain DNS name (IP literals in any spelling,
+   `/`, `@`, ...) → 403 (the cache is not an open proxy). Requests identified
+   only by user agent (Steam CDN hosts) are cache-only: GET/HEAD while the
+   platform is enabled, otherwise 403. Upstream names resolving only to
+   private/loopback/link-local addresses are refused unless
+   `--allow-private-upstream`. The SNI listener only relays names matching a
+   platform domain.
 2. Platform **disabled** → plain proxy, not cached (DNS also stops overriding it).
 3. Only `GET`/`HEAD` with upstream 200/206 are cached. Other methods/statuses are
    proxied verbatim. `?nocache=...` bypasses the cache. `Platform::cache_policy(path)`
@@ -138,7 +144,7 @@ Unknown/missing platforms default to enabled; missing `managed` entries default 
    never cached; the final body is stored under the original key.
 7. **Loop detection**: requests carrying `X-GameCacher-Processed-By: <instance-id>`
    get 508. Upstream requests carry that header. Responses carry `X-GameCacher-Status: HIT|MISS|BYPASS`.
-8. Platform `hide_etag()` (Blizzard) strips `ETag` from responses.
+8. Platform `hide_etag()` (Blizzard) strips `ETag` and `Last-Modified` from responses.
 9. Upstream resolution uses `--upstream-dns` (never our own DNS); if the
    resolved address is one of `--cache-ip`, the request fails with 508.
 10. LRU index: every slice read/write touches the object's `last_access` in
@@ -146,7 +152,10 @@ Unknown/missing platforms default to enabled; missing `managed` entries default 
     listing `cache/` if missing; a loaded snapshot is reconciled against a
     background listing at startup (crash recovery). When `total > max_size`
     (checked every 60s, and immediately when a write crosses the limit), evict
-    whole objects oldest-first down to 90% of max.
+    whole objects oldest-first down to 90% of max. The index also keeps an
+    in-memory bitset of stored slices per object (rebuilt from listings and
+    reads); `Prefill::warm` skips per-slice storage checks only when every
+    slice bit is set.
 
 ## Platforms
 
@@ -155,7 +164,8 @@ Trait `Platform` (`platforms/mod.rs`): `id`, `name`, `description`, `domains`,
 Domain lists come from uklans/cache-domains (`platforms/domains.rs`).
 
 `ManagedUpdates`: `login_methods`, `auth_status`, `login(step)`, `logout`,
-`list_games`, `update_game(game_id) -> UpdateReport`. Platforms fetch content
+`list_games`, `update_game(game_id) -> UpdateReport`, `validate_selection`
+(Windows Update rejects non-WU URLs with 400 when the selection is saved). Platforms fetch content
 through the `Prefill` handle, which runs the request through the cache
 engine in-process (with the platform identifier), so later LAN clients hit.
 Every run re-enumerates the selected games' content and warms it, which
@@ -167,7 +177,7 @@ with `bytes_downloaded > 0`). Prefill and runs are refused for disabled platform
 |---|---|---|---|---|
 | Steam | QR or password+Guard (CM via steam-vent), refresh token in secrets | licenses → PICS | PICS buildid / manifest gid per depot | manifest → `/depot/<id>/chunk/<sha>` |
 | Epic | auth code paste (legendary flow), refresh token in secrets | launcher assets | buildVersion | manifest → ChunksV4 paths |
-| Blizzard | none | fixed product catalog (wow, wow_classic, pro, d3, hs, s2, hero, fenris, ...) | `versions` BuildConfig hash | build/cdn config, encoding, archive indexes + archives |
+| Blizzard | none | fixed product catalog (wow, wow_classic, pro, d3, hs, s2, hero, fenris, ...) | `versions` BuildConfig hash | build/cdn config, encoding/install/download/size, archive indexes + archives, loose files (encoding ekeys in no archive index) |
 | Windows Update | none | user-entered URLs | every run (warm reports cached vs downloaded) | GET each URL |
 | Origin | passive only | — | — | — |
 
