@@ -18,7 +18,8 @@ type Stage =
   | { kind: "idle" }
   | { kind: "qr"; challengeId: string; url: string }
   | { kind: "guard"; challengeId: string; guardType: GuardType }
-  | { kind: "device"; challengeId: string };
+  | { kind: "device"; challengeId: string }
+  | { kind: "waiting"; challengeId: string };
 
 const POLL_MS = 2000;
 
@@ -51,7 +52,14 @@ export function AuthPanel({ platformId, status, onChanged }: AuthPanelProps) {
         setStage({ kind: "qr", challengeId: res.challenge_id, url: res.url });
         break;
       case "pending":
-        break; // keep waiting; the poll loop schedules the next check
+        // Already polling: the loop schedules the next check. Otherwise (e.g. a guard
+        // submit Steam hasn't finished) switch to the "waiting" stage, which polls.
+        setStage((prev) =>
+          prev.kind === "qr" || prev.kind === "device" || prev.kind === "waiting"
+            ? prev
+            : { kind: "waiting", challengeId: res.challenge_id },
+        );
+        break;
       case "guard_required":
         // "email" / "device" (authenticator code): show the code form.
         // "device_confirmation": approve on the phone and keep polling qr_poll.
@@ -94,7 +102,8 @@ export function AuthPanel({ platformId, status, onChanged }: AuthPanelProps) {
   };
 
   // Poll qr_poll every 2s while waiting for a QR scan or a device approval.
-  const challengeId = stage.kind === "qr" || stage.kind === "device" ? stage.challengeId : null;
+  const challengeId =
+    stage.kind === "qr" || stage.kind === "device" || stage.kind === "waiting" ? stage.challengeId : null;
   const applyRef = useRef(apply);
   useEffect(() => {
     applyRef.current = apply;
@@ -237,6 +246,20 @@ function PasswordSection({
             Cancel
           </Button>
         </div>
+      </div>
+    );
+  }
+
+  if (stage.kind === "waiting") {
+    return (
+      <div className="space-y-2 text-sm">
+        <div className="flex items-center gap-2 text-text-primary">
+          <Spinner /> Waiting for Steam to finish signing in...
+        </div>
+        <p className="text-text-secondary">Your code was accepted. This page continues automatically.</p>
+        <Button variant="ghost" size="sm" onClick={onCancel}>
+          Cancel
+        </Button>
       </div>
     );
   }
