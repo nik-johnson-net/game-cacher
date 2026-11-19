@@ -24,19 +24,56 @@ impl HostResolver for StaticResolver {
     }
 }
 
-/// Hickory resolver pointed at the configured upstream DNS servers. TODO(T3).
-pub struct DnsResolver {}
+/// Hickory resolver pointed only at the configured upstream DNS servers
+/// (UDP and TCP); no system config and no hosts file.
+pub struct DnsResolver {
+    resolver: hickory_resolver::TokioResolver,
+}
 
 impl DnsResolver {
-    pub fn new(_servers: &[SocketAddr]) -> Result<Self> {
-        todo!("T3")
+    pub fn new(servers: &[SocketAddr]) -> Result<Self> {
+        use hickory_resolver::config::{NameServerConfig, ResolveHosts, ResolverConfig};
+        use hickory_resolver::name_server::TokioConnectionProvider;
+        use hickory_resolver::proto::xfer::Protocol;
+
+        if servers.is_empty() {
+            anyhow::bail!("no upstream DNS servers configured");
+        }
+        let mut config = ResolverConfig::new();
+        for s in servers {
+            config.add_name_server(NameServerConfig::new(*s, Protocol::Udp));
+            config.add_name_server(NameServerConfig::new(*s, Protocol::Tcp));
+        }
+        let mut builder = hickory_resolver::Resolver::builder_with_config(
+            config,
+            TokioConnectionProvider::default(),
+        );
+        let opts = builder.options_mut();
+        opts.use_hosts_file = ResolveHosts::Never;
+        opts.attempts = 2;
+        opts.timeout = Duration::from_secs(5);
+        Ok(Self {
+            resolver: builder.build(),
+        })
     }
 }
 
 #[async_trait]
 impl HostResolver for DnsResolver {
-    async fn resolve(&self, _host: &str) -> Result<Vec<IpAddr>> {
-        todo!("T3")
+    async fn resolve(&self, host: &str) -> Result<Vec<IpAddr>> {
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            return Ok(vec![ip]);
+        }
+        let lookup = self
+            .resolver
+            .lookup_ip(host)
+            .await
+            .map_err(|e| anyhow::anyhow!("resolving {host} via upstream DNS: {e}"))?;
+        let ips: Vec<IpAddr> = lookup.iter().collect();
+        if ips.is_empty() {
+            anyhow::bail!("no addresses for {host}");
+        }
+        Ok(ips)
     }
 }
 
@@ -164,6 +201,21 @@ mod tests {
             vec![own],
         );
         assert_eq!(g.resolve("x").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dns_resolver_ip_literal_and_config() {
+        assert!(DnsResolver::new(&[]).is_err());
+        // Nothing listens here, so a query would fail: literals must not query.
+        let r = DnsResolver::new(&["127.0.0.1:9".parse().unwrap()]).unwrap();
+        assert_eq!(
+            r.resolve("203.0.113.7").await.unwrap(),
+            vec!["203.0.113.7".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(
+            r.resolve("::1").await.unwrap(),
+            vec!["::1".parse::<IpAddr>().unwrap()]
+        );
     }
 
     #[test]
