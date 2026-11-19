@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -180,6 +181,7 @@ async fn content_server() -> SocketAddr {
 struct Harness {
     app: app::RunningApp,
     client: reqwest::Client,
+    secrets: Arc<MemSecrets>,
 }
 
 impl Harness {
@@ -255,6 +257,15 @@ impl Harness {
 }
 
 async fn start_app(content: SocketAddr) -> Harness {
+    start_app_with(content, Arc::new(FakeSteam), true).await
+}
+
+/// Starts the app on `backend`; `seeded` pre-stores a completed login.
+async fn start_app_with(
+    content: SocketAddr,
+    backend: Arc<dyn SteamBackend>,
+    seeded: bool,
+) -> Harness {
     let port = content.port().to_string();
     let config = Config::parse_from([
         "game-cacher",
@@ -280,19 +291,21 @@ async fn start_app(content: SocketAddr) -> Harness {
         admin_password: Some(PW.into()),
         ..Default::default()
     };
-    // Pre-seed what a completed login would have stored.
     let storage: DynStorage = Arc::new(MemoryStorage::new());
-    storage
-        .put(
-            "state/steam.json",
-            Bytes::from(json!({"account": "alice"}).to_string()),
-        )
-        .await
-        .unwrap();
-    let secrets = MemSecrets::default();
-    secrets.put(REFRESH_TOKEN_SECRET, "refresh").await.unwrap();
+    let secrets = Arc::new(MemSecrets::default());
+    if seeded {
+        // Pre-seed what a completed login would have stored.
+        storage
+            .put(
+                "state/steam.json",
+                Bytes::from(json!({"account": "alice"}).to_string()),
+            )
+            .await
+            .unwrap();
+        secrets.put(REFRESH_TOKEN_SECRET, "refresh").await.unwrap();
+    }
     let steam = Steam {
-        managed: SteamManaged::new(Box::new(|_| Arc::new(FakeSteam)), auth::SESSION_TTL),
+        managed: SteamManaged::new(Box::new(move |_| backend.clone()), auth::SESSION_TTL),
     };
     let app = app::start(
         config,
@@ -300,7 +313,7 @@ async fn start_app(content: SocketAddr) -> Harness {
         Overrides {
             resolver: Some(Arc::new(StaticResolver([127, 0, 0, 1].into()))),
             storage: Some(storage),
-            secrets: Some(Arc::new(secrets)),
+            secrets: Some(secrets.clone()),
             platforms: Some(vec![Arc::new(steam) as DynPlatform]),
             ..Default::default()
         },
@@ -310,6 +323,7 @@ async fn start_app(content: SocketAddr) -> Harness {
     Harness {
         app,
         client: reqwest::Client::new(),
+        secrets,
     }
 }
 
@@ -361,5 +375,239 @@ async fn steam_select_run_purge_repair() {
     for sha in &SHAS {
         assert_eq!(h.chunk_status(sha).await, "HIT");
     }
+    h.app.shutdown().await;
+}
+
+const CODE_OK: &str = "12345";
+
+/// Scripted login: QR / credentials start fine; the poll yields a refresh
+/// token once `approved` is set (by the test for QR, by a correct guard code).
+struct ScriptedAuth {
+    guard: GuardKind,
+    approved: AtomicBool,
+    rsa: rsa::RsaPrivateKey,
+}
+
+impl ScriptedAuth {
+    fn new(guard: GuardKind) -> Arc<Self> {
+        Arc::new(Self {
+            guard,
+            approved: AtomicBool::new(false),
+            rsa: rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 512).unwrap(),
+        })
+    }
+}
+
+fn start(steam_id: u64, confirmations: Vec<GuardKind>) -> AuthSessionStart {
+    AuthSessionStart {
+        client_id: 9,
+        request_id: vec![1, 2, 3],
+        interval: 0.0,
+        allowed_confirmations: confirmations,
+        steam_id,
+        challenge_url: "https://s.team/q/1/9".into(),
+    }
+}
+
+#[async_trait]
+impl SteamAuth for ScriptedAuth {
+    async fn password_rsa_key(&self, _: &str) -> Result<RsaKey> {
+        use rsa::traits::PublicKeyParts;
+        Ok(RsaKey {
+            modulus_hex: self.rsa.n().to_str_radix(16),
+            exponent_hex: self.rsa.e().to_str_radix(16),
+            timestamp: 1,
+        })
+    }
+    async fn begin_qr(&self) -> Result<AuthSessionStart> {
+        Ok(start(0, vec![GuardKind::DeviceConfirmation]))
+    }
+    async fn begin_credentials(
+        &self,
+        account: &str,
+        enc: &str,
+        _: u64,
+    ) -> Result<AuthSessionStart> {
+        use base64::Engine;
+        let plain = self.rsa.decrypt(
+            rsa::Pkcs1v15Encrypt,
+            &base64::prelude::BASE64_STANDARD.decode(enc)?,
+        )?;
+        anyhow::ensure!(plain == b"s3cret" && account == "bob", "invalid password");
+        Ok(start(76561, vec![self.guard]))
+    }
+    async fn submit_guard_code(&self, _: u64, _: u64, code: &str, kind: GuardKind) -> Result<()> {
+        anyhow::ensure!(kind == self.guard, "wrong guard kind {kind:?}");
+        anyhow::ensure!(code == CODE_OK, "invalid Steam Guard code (EResult 65)");
+        self.approved.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+    async fn poll(&self, _: u64, _: &[u8]) -> Result<PollResult> {
+        let approved = self.approved.load(Ordering::SeqCst);
+        Ok(PollResult {
+            refresh_token: approved.then(|| "rt-new".to_string()),
+            // QR polls report the account; credential logins fall back to the username.
+            account_name: (approved && self.guard == GuardKind::DeviceConfirmation)
+                .then(|| "alice".to_string()),
+            ..Default::default()
+        })
+    }
+}
+
+struct Scripted(Arc<ScriptedAuth>);
+
+#[async_trait]
+impl SteamAuth for Scripted {
+    async fn password_rsa_key(&self, a: &str) -> Result<RsaKey> {
+        self.0.password_rsa_key(a).await
+    }
+    async fn begin_qr(&self) -> Result<AuthSessionStart> {
+        self.0.begin_qr().await
+    }
+    async fn begin_credentials(&self, a: &str, e: &str, t: u64) -> Result<AuthSessionStart> {
+        self.0.begin_credentials(a, e, t).await
+    }
+    async fn submit_guard_code(&self, c: u64, s: u64, code: &str, k: GuardKind) -> Result<()> {
+        self.0.submit_guard_code(c, s, code, k).await
+    }
+    async fn poll(&self, c: u64, r: &[u8]) -> Result<PollResult> {
+        self.0.poll(c, r).await
+    }
+}
+
+#[async_trait]
+impl SteamBackend for Scripted {
+    async fn connect(&self, _: &str, _: &str) -> Result<Box<dyn SteamSession>> {
+        anyhow::bail!("no CM in login tests")
+    }
+}
+
+async fn login_harness(guard: GuardKind) -> (Harness, Arc<ScriptedAuth>) {
+    let script = ScriptedAuth::new(guard);
+    let h = start_app_with(
+        SocketAddr::from(([127, 0, 0, 1], 1)),
+        Arc::new(Scripted(script.clone())),
+        false,
+    )
+    .await;
+    (h, script)
+}
+
+impl Harness {
+    async fn login(&self, body: Value) -> Value {
+        let (s, v) = self
+            .call(
+                Method::POST,
+                "/api/platforms/steam/managed/login",
+                Some(body),
+            )
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        v
+    }
+
+    async fn assert_logged_in(&self, account: &str) {
+        let v = self.status().await;
+        assert_eq!(v["auth"]["logged_in"], true, "{v}");
+        assert_eq!(v["auth"]["account"], account);
+        let token = self.secrets.get(REFRESH_TOKEN_SECRET).await.unwrap();
+        assert_eq!(token.as_deref(), Some("rt-new"));
+    }
+}
+
+#[tokio::test]
+async fn steam_qr_login_and_logout() {
+    let (h, script) = login_harness(GuardKind::DeviceConfirmation).await;
+    let v = h.status().await;
+    assert_eq!(v["auth"]["logged_in"], false);
+    assert!(h.secrets.get(REFRESH_TOKEN_SECRET).await.unwrap().is_none());
+
+    let v = h.login(json!({"method": "qr"})).await;
+    assert_eq!(v["status"], "qr");
+    assert_eq!(v["url"], "https://s.team/q/1/9");
+    let id = v["challenge_id"].as_str().unwrap().to_string();
+
+    let poll = json!({"method": "qr_poll", "challenge_id": id});
+    let v = h.login(poll.clone()).await;
+    assert_eq!(v["status"], "pending");
+    assert_eq!(v["challenge_id"], id.as_str());
+
+    script.approved.store(true, Ordering::SeqCst);
+    let v = h.login(poll.clone()).await;
+    assert_eq!(v, json!({"status": "logged_in", "account": "alice"}));
+    h.assert_logged_in("alice").await;
+
+    // The challenge is consumed by success.
+    assert_eq!(h.login(poll).await["status"], "failed");
+
+    let (s, _) = h
+        .call(Method::POST, "/api/platforms/steam/managed/logout", None)
+        .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    assert_eq!(h.status().await["auth"]["logged_in"], false);
+    assert!(h.secrets.get(REFRESH_TOKEN_SECRET).await.unwrap().is_none());
+    h.app.shutdown().await;
+}
+
+#[tokio::test]
+async fn steam_password_email_guard_login() {
+    let (h, _) = login_harness(GuardKind::EmailCode).await;
+    let v = h
+        .login(json!({"method": "password", "username": "bob", "password": "s3cret"}))
+        .await;
+    assert_eq!(v["status"], "guard_required");
+    assert_eq!(v["guard_type"], "email");
+    let id = v["challenge_id"].as_str().unwrap().to_string();
+
+    // A wrong code fails but keeps the challenge so the user can retry.
+    let v = h
+        .login(json!({"method": "guard", "challenge_id": id, "code": "00000"}))
+        .await;
+    assert_eq!(v["status"], "failed");
+    assert!(v["message"].as_str().unwrap().contains("rejected"), "{v}");
+    assert_eq!(h.status().await["auth"]["logged_in"], false);
+
+    let v = h
+        .login(json!({"method": "guard", "challenge_id": id, "code": format!(" {CODE_OK} ")}))
+        .await;
+    assert_eq!(v, json!({"status": "logged_in", "account": "bob"}));
+    h.assert_logged_in("bob").await;
+    h.app.shutdown().await;
+}
+
+#[tokio::test]
+async fn steam_password_authenticator_login() {
+    let (h, _) = login_harness(GuardKind::DeviceCode).await;
+    let v = h
+        .login(json!({"method": "password", "username": "bob", "password": "s3cret"}))
+        .await;
+    assert_eq!(v["status"], "guard_required");
+    assert_eq!(v["guard_type"], "device");
+    let id = v["challenge_id"].as_str().unwrap();
+    let v = h
+        .login(json!({"method": "guard", "challenge_id": id, "code": CODE_OK}))
+        .await;
+    assert_eq!(v, json!({"status": "logged_in", "account": "bob"}));
+    h.assert_logged_in("bob").await;
+    h.app.shutdown().await;
+}
+
+#[tokio::test]
+async fn steam_login_bad_password_and_unknown_challenge() {
+    let (h, _) = login_harness(GuardKind::EmailCode).await;
+    let v = h
+        .login(json!({"method": "password", "username": "bob", "password": "nope"}))
+        .await;
+    assert_eq!(v["status"], "failed");
+
+    for body in [
+        json!({"method": "qr_poll", "challenge_id": "nonexistent"}),
+        json!({"method": "guard", "challenge_id": "nonexistent", "code": CODE_OK}),
+    ] {
+        let v = h.login(body).await;
+        assert_eq!(v["status"], "failed", "{v}");
+        assert!(v["message"].as_str().unwrap().contains("expired"), "{v}");
+    }
+    assert_eq!(h.status().await["auth"]["logged_in"], false);
     h.app.shutdown().await;
 }
