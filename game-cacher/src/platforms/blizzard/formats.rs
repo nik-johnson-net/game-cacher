@@ -1,0 +1,287 @@
+//! TACT binary formats: BLTE containers, the encoding file and CDN archive indices.
+
+use std::io::Read;
+
+use anyhow::{Result, bail, ensure};
+use flate2::read::ZlibDecoder;
+
+fn be(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0, |a, b| (a << 8) | u64::from(*b))
+}
+
+fn slice(data: &[u8], start: usize, len: usize) -> Result<&[u8]> {
+    start
+        .checked_add(len)
+        .and_then(|end| data.get(start..end))
+        .ok_or_else(|| anyhow::anyhow!("truncated data at offset {start} (+{len})"))
+}
+
+fn decode_chunk(chunk: &[u8], out: &mut Vec<u8>) -> Result<()> {
+    let Some((&mode, body)) = chunk.split_first() else {
+        bail!("empty BLTE chunk");
+    };
+    match mode {
+        b'N' => out.extend_from_slice(body),
+        b'Z' => {
+            ZlibDecoder::new(body).read_to_end(out)?;
+        }
+        m => bail!("unsupported BLTE chunk mode {:?}", m as char),
+    }
+    Ok(())
+}
+
+/// Decodes a BLTE container (chunk modes `N` and `Z`). Chunk MD5s are not verified.
+pub fn decode_blte(data: &[u8]) -> Result<Vec<u8>> {
+    ensure!(slice(data, 0, 4)? == b"BLTE", "not a BLTE container");
+    let header_size = be(slice(data, 4, 4)?) as usize;
+    let mut out = Vec::new();
+    if header_size == 0 {
+        decode_chunk(&data[8..], &mut out)?;
+        return Ok(out);
+    }
+    let table = slice(data, 8, 4)?;
+    let count = be(&table[1..4]) as usize;
+    ensure!(
+        header_size == 12 + count * 24,
+        "BLTE header size {header_size} does not match {count} chunks"
+    );
+    let mut pos = header_size;
+    for i in 0..count {
+        let compressed = be(slice(data, 12 + i * 24, 4)?) as usize;
+        decode_chunk(slice(data, pos, compressed)?, &mut out)?;
+        pos += compressed;
+    }
+    Ok(out)
+}
+
+/// All encoding keys listed in an (already BLTE-decoded) encoding file's CEKey pages.
+pub fn encoding_ekeys(data: &[u8]) -> Result<Vec<Vec<u8>>> {
+    ensure!(slice(data, 0, 2)? == b"EN", "not an encoding file");
+    let h = slice(data, 0, 22)?;
+    let (ckey_size, ekey_size) = (h[3] as usize, h[4] as usize);
+    let page_size = be(&h[5..7]) as usize * 1024;
+    let page_count = be(&h[9..13]) as usize;
+    let espec_size = be(&h[18..22]) as usize;
+    let index_entry = ckey_size + 16;
+    let pages_start = 22 + espec_size + page_count * index_entry;
+    let mut out = Vec::new();
+    for p in 0..page_count {
+        let page = slice(data, pages_start + p * page_size, page_size)?;
+        let mut pos = 0;
+        while let Some(&keys) = page.get(pos) {
+            if keys == 0 {
+                break;
+            }
+            pos += 1 + 5 + ckey_size;
+            for _ in 0..keys {
+                out.push(slice(page, pos, ekey_size)?.to_vec());
+                pos += ekey_size;
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Keys of all entries in a CDN archive `.index` file.
+pub fn index_keys(data: &[u8]) -> Result<Vec<Vec<u8>>> {
+    // Footer: toc_hash[cs], version, 2 reserved, block_size_kb, offset_bytes, size_bytes,
+    // key_size, checksum_size, num_elements (LE u32), footer_hash[cs]. checksum_size
+    // is 8 in practice but also locates itself, so probe for a consistent value.
+    let len = data.len();
+    let Some(cs) =
+        (1..=16usize).find(|&cs| len >= 12 + 2 * cs && data[len - cs - 5] as usize == cs)
+    else {
+        bail!("unrecognised archive index footer");
+    };
+    let footer = &data[len - (12 + 2 * cs)..];
+    ensure!(footer[cs] == 1, "unsupported index version {}", footer[cs]);
+    let block_size = footer[cs + 3] as usize * 1024;
+    let (offset_bytes, size_bytes, key_size) = (
+        footer[cs + 4] as usize,
+        footer[cs + 5] as usize,
+        footer[cs + 6] as usize,
+    );
+    let count = u32::from_le_bytes(footer[cs + 8..cs + 12].try_into()?) as usize;
+    let entry = key_size + size_bytes + offset_bytes;
+    ensure!(entry > 0 && block_size >= entry, "invalid index geometry");
+    let per_block = block_size / entry;
+    let mut out = Vec::with_capacity(count.min(1 << 20));
+    for i in 0..count {
+        let start = (i / per_block) * block_size + (i % per_block) * entry;
+        out.push(slice(data, start, key_size)?.to_vec());
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+pub mod testing {
+    //! Synthetic builders for the formats above.
+    use std::io::Write;
+
+    use flate2::Compression;
+    use flate2::write::ZlibEncoder;
+
+    pub fn zlib(data: &[u8]) -> Vec<u8> {
+        let mut e = ZlibEncoder::new(Vec::new(), Compression::default());
+        e.write_all(data).unwrap();
+        e.finish().unwrap()
+    }
+
+    /// Chunks are `(mode, decoded)`; mode `N` stores raw, `Z` zlib.
+    pub fn blte(chunks: &[(u8, &[u8])]) -> Vec<u8> {
+        let bodies: Vec<Vec<u8>> = chunks
+            .iter()
+            .map(|(m, d)| {
+                let mut v = vec![*m];
+                v.extend(if *m == b'Z' { zlib(d) } else { d.to_vec() });
+                v
+            })
+            .collect();
+        let mut out = b"BLTE".to_vec();
+        out.extend(((12 + chunks.len() * 24) as u32).to_be_bytes());
+        out.push(0x0F);
+        out.extend(&(chunks.len() as u32).to_be_bytes()[1..]);
+        for (b, (_, d)) in bodies.iter().zip(chunks) {
+            out.extend((b.len() as u32).to_be_bytes());
+            out.extend((d.len() as u32).to_be_bytes());
+            out.extend([0u8; 16]);
+        }
+        bodies.into_iter().for_each(|b| out.extend(b));
+        out
+    }
+
+    /// Single-chunk BLTE with a zero header size.
+    pub fn blte_simple(mode: u8, decoded: &[u8]) -> Vec<u8> {
+        let mut out = b"BLTE".to_vec();
+        out.extend(0u32.to_be_bytes());
+        out.push(mode);
+        out.extend(if mode == b'Z' {
+            zlib(decoded)
+        } else {
+            decoded.to_vec()
+        });
+        out
+    }
+
+    pub type CeEntry = ([u8; 16], Vec<[u8; 16]>);
+
+    /// Encoding file with one 1 KiB CEKey page per group; entries are `(ckey, ekeys)`.
+    pub fn encoding(pages: &[Vec<CeEntry>]) -> Vec<u8> {
+        let page_kb = 1u16;
+        let mut out = b"EN".to_vec();
+        out.extend([1, 16, 16]);
+        out.extend(page_kb.to_be_bytes());
+        out.extend(page_kb.to_be_bytes());
+        out.extend((pages.len() as u32).to_be_bytes());
+        out.extend(0u32.to_be_bytes());
+        out.push(0);
+        let espec = b"z\0";
+        out.extend((espec.len() as u32).to_be_bytes());
+        out.extend(espec);
+        for p in pages {
+            out.extend(p[0].0);
+            out.extend([0u8; 16]);
+        }
+        for p in pages {
+            let mut page = Vec::new();
+            for (ckey, ekeys) in p {
+                page.push(ekeys.len() as u8);
+                page.extend([0, 0, 0, 0, 1]);
+                page.extend(ckey);
+                ekeys.iter().for_each(|e| page.extend(e));
+            }
+            page.resize(page_kb as usize * 1024, 0);
+            out.extend(page);
+        }
+        out
+    }
+
+    /// Archive index with 4 KiB blocks, 16-byte keys, 4-byte sizes and offsets.
+    pub fn index(keys: &[[u8; 16]]) -> Vec<u8> {
+        let per_block = 4096 / 24;
+        let mut out = Vec::new();
+        for chunk in keys.chunks(per_block) {
+            let mut block = Vec::new();
+            for k in chunk {
+                block.extend(k);
+                block.extend(100u32.to_be_bytes());
+                block.extend(0u32.to_be_bytes());
+            }
+            block.resize(4096, 0);
+            out.extend(block);
+        }
+        out.extend([0u8; 8]); // toc hash (unused by the parser)
+        out.extend([1, 0, 0, 4, 4, 4, 16, 8]);
+        out.extend((keys.len() as u32).to_le_bytes());
+        out.extend([0u8; 8]);
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::*;
+    use super::*;
+
+    #[test]
+    fn blte_chunks_and_simple_form() {
+        let multi = blte(&[(b'N', b"hello "), (b'Z', b"world"), (b'Z', b"!")]);
+        assert_eq!(decode_blte(&multi).unwrap(), b"hello world!");
+        assert_eq!(decode_blte(&blte_simple(b'N', b"raw")).unwrap(), b"raw");
+        assert_eq!(
+            decode_blte(&blte_simple(b'Z', b"zipped")).unwrap(),
+            b"zipped"
+        );
+    }
+
+    #[test]
+    fn blte_errors() {
+        assert!(decode_blte(b"XXXX\0\0\0\0N").is_err());
+        assert!(decode_blte(b"BLT").is_err());
+        let e = decode_blte(&blte(&[(b'E', b"x")])).unwrap_err();
+        assert!(e.to_string().contains("mode"), "{e}");
+        let mut truncated = blte(&[(b'N', b"hello")]);
+        truncated.truncate(truncated.len() - 2);
+        assert!(decode_blte(&truncated).is_err());
+    }
+
+    #[test]
+    fn encoding_lists_all_ekeys() {
+        let k = |n: u8| [n; 16];
+        let data = encoding(&[
+            vec![(k(1), vec![k(0xa1)]), (k(2), vec![k(0xa2), k(0xa3)])],
+            vec![(k(3), vec![k(0xa4)])],
+        ]);
+        assert_eq!(
+            encoding_ekeys(&data).unwrap(),
+            vec![
+                k(0xa1).to_vec(),
+                k(0xa2).to_vec(),
+                k(0xa3).to_vec(),
+                k(0xa4).to_vec()
+            ]
+        );
+        assert!(encoding_ekeys(b"XX").is_err());
+        assert!(encoding_ekeys(&data[..data.len() - 1500]).is_err());
+    }
+
+    #[test]
+    fn index_keys_across_blocks() {
+        let keys: Vec<[u8; 16]> = (0..400u16)
+            .map(|i| {
+                let mut k = [0u8; 16];
+                k[..2].copy_from_slice(&i.to_be_bytes());
+                k
+            })
+            .collect();
+        let parsed = index_keys(&index(&keys)).unwrap();
+        assert_eq!(parsed.len(), 400);
+        assert_eq!(parsed[0], keys[0].to_vec());
+        assert_eq!(parsed[399], keys[399].to_vec());
+        assert_eq!(index_keys(&index(&[])).unwrap().len(), 0);
+        assert!(index_keys(&[0u8; 10]).is_err());
+        let mut bad = index(&keys);
+        bad.drain(..4096);
+        assert!(index_keys(&bad).is_err());
+    }
+}

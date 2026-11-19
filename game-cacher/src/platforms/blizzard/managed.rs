@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
 use serde_json::{Value, json};
 
+use super::formats;
 use super::tact::{self, cdn_path, parse_bpsv, parse_config, values};
 use super::{Blizzard, domains};
 use crate::platforms::{
@@ -135,9 +136,8 @@ impl Blizzard {
         let mut state = ctx.state.load().await?;
         let prev = state.get(product).cloned().unwrap_or(Value::Null);
         report.previous_version = prev["version"].as_str().map(str::to_string);
-        if prev["build_config"] == build_hash.as_str() && prev["cdn_config"] == cdn_hash.as_str() {
-            return Ok(());
-        }
+        let changed =
+            prev["build_config"] != build_hash.as_str() || prev["cdn_config"] != cdn_hash.as_str();
 
         let cdns = self.fetch_table(ctx, product, "cdns").await?;
         let Some(c) = cdns.region(REGION) else {
@@ -165,9 +165,23 @@ impl Blizzard {
         let build_cfg = get_cfg(build_hash.clone()).await?;
         let cdn_cfg = get_cfg(cdn_hash.clone()).await?;
 
-        self.warm_all(ctx, &host, plan_paths(&path, &build_cfg, &cdn_cfg), report)
+        // Every run warms the full object set: when nothing changed these are cache hits
+        // (`bytes_already_cached`), and anything evicted or purged is fetched again.
+        let planned = plan_paths(&path, &build_cfg, &cdn_cfg);
+        self.warm_all(ctx, &host, planned.clone(), report, true)
             .await;
-        if report.error.is_none() {
+        match self
+            .loose_paths(ctx, &host, &path, &build_cfg, &cdn_cfg, &planned)
+            .await
+        {
+            Ok(loose) => self.warm_all(ctx, &host, loose, report, false).await,
+            Err(e) => {
+                report
+                    .error
+                    .get_or_insert_with(|| format!("loose files: {e:#}"));
+            }
+        }
+        if report.error.is_none() && changed {
             // Failed objects leave the state untouched so the next run retries.
             state[product] = json!({
                 "build_config": build_hash,
@@ -177,8 +191,57 @@ impl Blizzard {
             });
             ctx.state.save(&state).await?;
         }
-        report.updated = true;
+        report.updated = changed || report.bytes_downloaded > 0;
         Ok(())
+    }
+
+    /// Data paths of files stored outside archives: encoding-file ekeys not in any archive
+    /// index and not already planned. Empty when the build has no encoding file.
+    async fn loose_paths(
+        &self,
+        ctx: &PlatformCtx,
+        host: &str,
+        path: &str,
+        build: &std::collections::HashMap<String, String>,
+        cdn: &std::collections::HashMap<String, String>,
+        planned: &[String],
+    ) -> Result<Vec<String>> {
+        let enc_key = values(build, "encoding").get(1).map(|k| k.to_string());
+        let Some(enc) = enc_key.and_then(|k| cdn_path(path, "data", &k, "")) else {
+            return Ok(Vec::new());
+        };
+        let body = ctx.prefill.get(IDENTIFIER, host, &enc).await?;
+        let ekeys = formats::encoding_ekeys(&formats::decode_blte(&body).context(enc.clone())?)
+            .context("parsing encoding file")?;
+
+        let mut index_paths: Vec<String> = Vec::new();
+        for a in values(cdn, "archives") {
+            index_paths.extend(cdn_path(path, "data", a, ".index"));
+        }
+        let mut archived = std::collections::HashSet::new();
+        let prefill = ctx.prefill.clone();
+        let mut indices = stream::iter(index_paths)
+            .map(|p| {
+                let prefill = prefill.clone();
+                let host = host.to_string();
+                async move {
+                    let body = prefill.get(IDENTIFIER, &host, &p).await?;
+                    formats::index_keys(&body).with_context(|| p)
+                }
+            })
+            .buffer_unordered(WARM_CONCURRENCY);
+        while let Some(keys) = indices.next().await {
+            archived.extend(keys?);
+        }
+
+        let planned: std::collections::HashSet<&String> = planned.iter().collect();
+        let mut seen = std::collections::HashSet::new();
+        Ok(ekeys
+            .into_iter()
+            .filter(|k| !archived.contains(k) && seen.insert(k.clone()))
+            .filter_map(|k| cdn_path(path, "data", &hex::encode(k), ""))
+            .filter(|p| !planned.contains(p))
+            .collect())
     }
 
     async fn warm_all(
@@ -187,6 +250,7 @@ impl Blizzard {
         host: &str,
         paths: Vec<String>,
         report: &mut UpdateReport,
+        fatal: bool,
     ) {
         let mut results = stream::iter(paths)
             .map(|p| async move {
@@ -205,7 +269,9 @@ impl Blizzard {
                 }
                 Err(e) => {
                     log::warn!("blizzard warm failed: {e:#}");
-                    report.error.get_or_insert_with(|| format!("{e:#}"));
+                    if fatal {
+                        report.error.get_or_insert_with(|| format!("{e:#}"));
+                    }
                 }
             }
         }
@@ -266,12 +332,14 @@ impl ManagedUpdates for Blizzard {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
     use bytes::Bytes;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    use super::super::formats::testing::{blte, encoding, index};
     use super::*;
     use crate::platforms::{Prefill, WarmResult};
     use crate::secrets::SecretStore;
@@ -300,6 +368,9 @@ mod tests {
     struct MockPrefill {
         calls: Mutex<Vec<String>>,
         fail: Option<&'static str>,
+        fail_loose: bool,
+        /// Report everything as already cached instead of downloaded.
+        cached: AtomicBool,
     }
 
     impl MockPrefill {
@@ -326,12 +397,20 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("warm {id} {host}{p}"));
-            if self.fail.is_some_and(|f| p.contains(f)) {
+            if self.fail.is_some_and(|f| p.contains(f)) || (self.fail_loose && p.contains("/a3a3"))
+            {
                 bail!("boom");
             }
-            Ok(WarmResult {
-                bytes_downloaded: 10,
-                bytes_already_cached: 1,
+            Ok(if self.cached.load(Ordering::SeqCst) {
+                WarmResult {
+                    bytes_downloaded: 0,
+                    bytes_already_cached: 11,
+                }
+            } else {
+                WarmResult {
+                    bytes_downloaded: 10,
+                    bytes_already_cached: 1,
+                }
             })
         }
         async fn get(&self, id: &str, host: &str, p: &str) -> Result<Bytes> {
@@ -339,15 +418,27 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("get {id} {host}{p}"));
-            Ok(Bytes::from(match p {
-                _ if p.ends_with(BUILD) => {
-                    "root = rootc\nencoding = encc encekey1\ninstall = instc instekey\ndownload = dlc dlekey\nsize = sizec sizekey\n"
-                }
-                _ if p.ends_with(CDN) => {
-                    "archives = arch1111 arch2222\npatch-archives = parc3333\nfile-index = fidx4444\n"
-                }
+            let k = |n: u8| [n; 16];
+            Ok(match p {
+                _ if p.ends_with(BUILD) => Bytes::from(
+                    "root = rootc\nencoding = encc encekey1\ninstall = instc instekey\ndownload = dlc dlekey\nsize = sizec sizekey\n",
+                ),
+                _ if p.ends_with(CDN) => Bytes::from(
+                    "archives = arch1111 arch2222\npatch-archives = parc3333\nfile-index = fidx4444\n",
+                ),
+                // a1 and a2 live in archives; a3 is a loose file.
+                _ if p.ends_with("arch1111.index") => Bytes::from(index(&[k(0xa1)])),
+                _ if p.ends_with("arch2222.index") => Bytes::from(index(&[k(0xa2)])),
+                _ if p.ends_with("encekey1") => Bytes::from(blte(&[(
+                    b'Z',
+                    &encoding(&[vec![
+                        (k(1), vec![k(0xa1)]),
+                        (k(2), vec![k(0xa2)]),
+                        (k(3), vec![k(0xa3), k(0xa1)]),
+                    ]]),
+                )])),
                 _ => bail!("unexpected {p}"),
-            }))
+            })
         }
         async fn get_range(&self, _: &str, _: &str, _: &str, _: u64, _: u64) -> Result<Bytes> {
             bail!("unused")
@@ -396,7 +487,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn full_update_then_noop() {
+    async fn full_update_then_verify_then_repair() {
         let server = patch_server(BUILD).await;
         let b = Blizzard::with_patch_base(&server.uri());
         let prefill = Arc::new(MockPrefill::default());
@@ -407,14 +498,17 @@ mod tests {
         assert!(r.updated);
         assert_eq!(r.name, "World of Warcraft");
         assert_eq!(r.current_version.as_deref(), Some("1.2.3"));
-        assert_eq!(r.files, 11);
-        assert_eq!(r.bytes_downloaded, 110);
-        assert_eq!(r.bytes_already_cached, 11);
+        assert_eq!(r.files, 12);
+        assert_eq!(r.bytes_downloaded, 120);
+        assert_eq!(r.bytes_already_cached, 12);
         assert_eq!(
             prefill.calls("get"),
             vec![
                 "blizzard level3.blizzard.com/tpr/wow/config/aa/aa/aaaa1111",
                 "blizzard level3.blizzard.com/tpr/wow/config/bb/bb/bbbb2222",
+                "blizzard level3.blizzard.com/tpr/wow/data/ar/ch/arch1111.index",
+                "blizzard level3.blizzard.com/tpr/wow/data/ar/ch/arch2222.index",
+                "blizzard level3.blizzard.com/tpr/wow/data/en/ce/encekey1",
             ]
         );
         let h = "blizzard level3.blizzard.com/tpr/wow";
@@ -430,13 +524,15 @@ mod tests {
             "data/in/st/instekey",
             "data/dl/ek/dlekey",
             "data/si/ze/sizekey",
+            "data/a3/a3/a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3",
         ]
         .iter()
         .map(|s| format!("{h}/{s}"))
         .collect();
         want.sort();
-        // Root has no ekey in the build config, so it is not warmed .
-        assert_eq!(prefill.calls("warm").len(), 11);
+        // Root has no ekey in the build config, so it is not warmed. Archived ekeys
+        // (a1, a2) are not warmed as loose files; a3 is.
+        assert_eq!(prefill.calls("warm").len(), 12);
         assert_eq!(prefill.calls("warm"), want);
 
         let games = b.list_games(&ctx).await.unwrap();
@@ -450,14 +546,25 @@ mod tests {
             Some("1.2.3")
         );
 
-        let before = prefill.calls.lock().unwrap().len();
+        // Unchanged build with everything cached: verified, not updated.
+        prefill.cached.store(true, Ordering::SeqCst);
         let r2 = b.update_game(&ctx, "wow").await.unwrap();
         assert!(!r2.updated);
         assert_eq!(r2.error, None);
         assert_eq!(r2.current_version.as_deref(), Some("1.2.3"));
         assert_eq!(r2.previous_version.as_deref(), Some("1.2.3"));
-        assert_eq!((r2.files, r2.bytes_downloaded), (0, 0));
-        assert_eq!(prefill.calls.lock().unwrap().len(), before);
+        assert_eq!(
+            (r2.files, r2.bytes_downloaded, r2.bytes_already_cached),
+            (12, 0, 132)
+        );
+        assert_eq!(prefill.calls("warm").len(), 24);
+
+        // Same build but content had to be fetched again (purged/evicted): repaired.
+        prefill.cached.store(false, Ordering::SeqCst);
+        let r3 = b.update_game(&ctx, "wow").await.unwrap();
+        assert!(r3.updated);
+        assert_eq!(r3.bytes_downloaded, 120);
+        assert_eq!(r3.previous_version.as_deref(), Some("1.2.3"));
     }
 
     #[tokio::test]
@@ -471,9 +578,24 @@ mod tests {
         let ctx = ctx(prefill.clone()).await;
         let r = b.update_game(&ctx, "wow").await.unwrap();
         assert!(r.error.unwrap().contains("fidx4444"));
-        assert_eq!(r.files, 10);
+        assert_eq!(r.files, 11);
         // State not saved, so the next run is not a no-op.
         assert!(ctx.state.load().await.unwrap().get("wow").is_none());
+    }
+
+    #[tokio::test]
+    async fn loose_file_failure_is_tolerated() {
+        let server = patch_server(BUILD).await;
+        let b = Blizzard::with_patch_base(&server.uri());
+        let prefill = Arc::new(MockPrefill {
+            fail_loose: true,
+            ..Default::default()
+        });
+        let ctx = ctx(prefill.clone()).await;
+        let r = b.update_game(&ctx, "wow").await.unwrap();
+        assert_eq!(r.error, None);
+        assert_eq!(r.files, 11);
+        assert!(ctx.state.load().await.unwrap().get("wow").is_some());
     }
 
     #[tokio::test]
