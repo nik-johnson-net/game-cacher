@@ -6,7 +6,8 @@ use super::{ManagedUpdates, Platform, domains};
 
 mod client;
 mod managed;
-mod manifest;
+#[doc(hidden)]
+pub mod manifest;
 
 pub use client::Endpoints;
 
