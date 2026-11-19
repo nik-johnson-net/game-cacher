@@ -4,6 +4,10 @@
 pub mod engine;
 pub mod index;
 pub mod key;
+pub mod meta;
+mod proxy;
+pub mod range;
 
-pub use engine::CacheEngine;
+pub use engine::{CacheEngine, CacheError, EngineDeps};
 pub use index::{LruIndex, Usage};
+pub use proxy::STATUS_HEADER;
