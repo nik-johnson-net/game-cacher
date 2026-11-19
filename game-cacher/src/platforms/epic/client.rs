@@ -124,7 +124,9 @@ impl Client<'_> {
             ))
             .bearer_auth(access_token)
             .send()
-            .await?;
+            .await
+            // The URL contains the token; keep it out of error text and logs.
+            .map_err(|e| anyhow::anyhow!("killing Epic session: {}", e.without_url()))?;
         Ok(())
     }
 
