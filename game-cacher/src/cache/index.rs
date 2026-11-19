@@ -96,6 +96,10 @@ pub struct LruIndex {
     dirty: AtomicBool,
     on_remove: RwLock<Option<RemoveHook>>,
     evicting: tokio::sync::Mutex<()>,
+    /// Woken when a write pushes the total over the limit, so eviction doesn't wait for the tick.
+    over_limit: tokio::sync::Notify,
+    /// True when the snapshot was loaded (not rebuilt) and should be reconciled with storage.
+    needs_reconcile: AtomicBool,
 }
 
 fn now_secs() -> u64 {
@@ -150,6 +154,8 @@ impl LruIndex {
             dirty: AtomicBool::new(rebuilt),
             on_remove: RwLock::new(None),
             evicting: tokio::sync::Mutex::new(()),
+            over_limit: tokio::sync::Notify::new(),
+            needs_reconcile: AtomicBool::new(!rebuilt),
         }))
     }
 
@@ -184,8 +190,57 @@ impl LruIndex {
         let mut inner = self.lock();
         inner.touch(object_prefix, identifier).bytes += bytes;
         inner.total += bytes;
+        let over = self.max_bytes.is_some_and(|m| inner.total > m);
         drop(inner);
         self.dirty.store(true, Ordering::Relaxed);
+        if over {
+            self.over_limit.notify_one();
+        }
+    }
+
+    /// Brings a loaded snapshot in line with storage: objects written after the last
+    /// snapshot (e.g. before a crash) are added, deleted ones dropped, sizes corrected.
+    /// Entries touched after the listing started are left alone.
+    pub async fn reconcile(&self) -> Result<()> {
+        let started = now_secs();
+        let on_disk = rebuild(&self.storage).await?;
+        let (mut added, mut removed) = (0, Vec::new());
+        {
+            let mut inner = self.lock();
+            let stale: Vec<String> = inner
+                .objects
+                .iter()
+                .filter(|(p, e)| e.last_access < started && !on_disk.contains_key(*p))
+                .map(|(p, _)| p.clone())
+                .collect();
+            for p in stale {
+                inner.remove(&p);
+                removed.push(p);
+            }
+            for (prefix, disk) in on_disk {
+                match inner.objects.get_mut(&prefix) {
+                    Some(e) if e.last_access < started && e.bytes != disk.bytes => {
+                        let old = std::mem::replace(&mut e.bytes, disk.bytes);
+                        inner.total = inner.total - old + disk.bytes;
+                    }
+                    Some(_) => {}
+                    None => {
+                        inner.total += disk.bytes;
+                        inner.objects.insert(prefix, disk);
+                        added += 1;
+                    }
+                }
+            }
+        }
+        if added > 0 || !removed.is_empty() {
+            log::info!(
+                "LRU index reconciled: {added} objects added, {} removed",
+                removed.len()
+            );
+            self.dirty.store(true, Ordering::Relaxed);
+            self.notify_removed(&removed);
+        }
+        Ok(())
     }
 
     /// Forgets an object (after it was deleted from storage).
@@ -338,8 +393,16 @@ impl LruIndex {
             let mut tick = tokio::time::interval(period);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut seen = BTreeSet::new();
+            if index.needs_reconcile.swap(false, Ordering::Relaxed)
+                && let Err(e) = index.reconcile().await
+            {
+                log::warn!("reconciling LRU index: {e:#}");
+            }
             loop {
-                tick.tick().await;
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = index.over_limit.notified() => {}
+                }
                 index.maintain(&mut seen).await;
             }
         })
@@ -439,6 +502,57 @@ mod tests {
         got.sort();
         assert_eq!(got, vec!["p1", "p2", "p3"]);
         assert_eq!(idx.evict_if_needed().await.unwrap(), 0); // unbounded
+    }
+
+    #[tokio::test]
+    async fn reconcile_adds_missing_and_drops_deleted() {
+        let storage: DynStorage = Arc::new(MemoryStorage::new());
+        let a = put_object(&storage, "steam", "/a", 100).await;
+        let idx = index(&storage, None).await;
+        idx.snapshot().await.unwrap();
+        // Simulate a crash: objects written after the snapshot, and one deleted behind our back.
+        let b = put_object(&storage, "epic", "/b", 50).await;
+        storage.delete_prefix(&format!("{a}/")).await.unwrap();
+        let idx = index(&storage, None).await;
+        assert_eq!(
+            idx.usage().total_bytes,
+            102,
+            "stale snapshot before reconcile"
+        );
+        // Make the loaded entry look older than the reconcile start.
+        idx.lock().objects.get_mut(&a).unwrap().last_access = 1;
+        idx.reconcile().await.unwrap();
+        let u = idx.usage();
+        assert_eq!((u.total_bytes, u.objects), (52, 1));
+        assert!(u.per_identifier.contains_key("epic"));
+        assert!(idx.lock().objects.contains_key(&b));
+    }
+
+    #[tokio::test]
+    async fn write_over_limit_wakes_background_eviction() {
+        let storage: DynStorage = Arc::new(MemoryStorage::new());
+        let a = put_object(&storage, "steam", "/a", 100).await;
+        let idx = index(&storage, Some(150)).await;
+        let task = idx.spawn_background_every(Duration::from_secs(3600));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let b = ObjectKey::new("steam", "/b").prefix();
+        storage
+            .put(&format!("{b}/0"), Bytes::from(vec![0u8; 100]))
+            .await
+            .unwrap();
+        idx.record_write(&b, "steam", 100);
+        for _ in 0..50 {
+            if idx.usage().total_bytes <= 137 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(idx.usage().total_bytes, 100);
+        assert!(
+            storage.list(&format!("{a}/")).await.unwrap().is_empty(),
+            "oldest evicted"
+        );
+        task.abort();
     }
 
     #[tokio::test]

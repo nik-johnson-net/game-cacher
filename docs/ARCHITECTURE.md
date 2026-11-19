@@ -98,7 +98,7 @@ lancache, so CDN tokens don't fragment the cache). `identifier` = platform id
 (`steam`, `epic`, `blizzard`, `origin`, `windowsupdate`).
 
 `meta.json`: `{ "identifier", "host", "path", "total_size", "slice_size",
-"content_type", "created": rfc3339 }`. `slice_size` is per object so changing
+"content_type", "etag"?, "last_modified"?, "created": rfc3339 }`. `slice_size` is per object so changing
 `--slice-size` never corrupts existing entries.
 
 ### settings.json
@@ -142,8 +142,10 @@ Unknown/missing platforms default to enabled; missing `managed` entries default 
    resolved address is one of `--cache-ip`, the request fails with 508.
 10. LRU index: every slice read/write touches the object's `last_access` in
     memory; snapshot to `index/lru.json` every 60s and on shutdown; rebuilt by
-    listing `cache/` if missing. When `total > max_size`, evict whole objects
-    oldest-first down to 90% of max.
+    listing `cache/` if missing; a loaded snapshot is reconciled against a
+    background listing at startup (crash recovery). When `total > max_size`
+    (checked every 60s, and immediately when a write crosses the limit), evict
+    whole objects oldest-first down to 90% of max.
 
 ## Platforms
 
