@@ -14,6 +14,8 @@ pub use client::Endpoints;
 pub struct Epic {
     endpoints: Endpoints,
     token: Mutex<Option<managed::CachedToken>>,
+    /// Serializes load-modify-save cycles of the state document. Never held across network calls.
+    state_lock: Mutex<()>,
 }
 
 impl Epic {
@@ -26,6 +28,7 @@ impl Epic {
         Self {
             endpoints,
             token: Mutex::new(None),
+            state_lock: Mutex::new(()),
         }
     }
 }
