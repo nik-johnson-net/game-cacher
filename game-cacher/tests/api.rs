@@ -184,11 +184,12 @@ impl Harness {
             "10.99.0.1",
             "--slice-size",
             "65536",
-            "--ui-path",
-            "/nonexistent",
             "--upstream-http-port",
             &port,
         ];
+        if !extra.contains(&"--ui-path") {
+            args.extend_from_slice(&["--ui-path", "/nonexistent"]);
+        }
         args.extend_from_slice(extra);
         let config = Config::parse_from(args);
         let env = EnvSecrets {
