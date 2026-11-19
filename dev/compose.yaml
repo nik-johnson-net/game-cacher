@@ -1,0 +1,64 @@
+# Local stack for development and end-to-end testing: game-cacher with S3 storage
+# (SeaweedFS) and Vault secrets (dev mode).
+#
+#   docker build -f docker/Dockerfile -t game-cacher:dev .
+#   docker compose -f dev/compose.yaml up -d
+#   open http://127.0.0.1:8080   (password: admin)
+#
+# Ports are remapped so they don't need root: DNS 5353, cache HTTP 8081, SNI 8443.
+# Try it:  dig @127.0.0.1 -p 5353 lancache.steamcontent.com
+name: game-cacher-dev
+
+volumes:
+  s3: {}
+
+services:
+  # SeaweedFS's S3 gateway with auth disabled (any credentials are accepted).
+  s3:
+    image: docker.io/chrislusf/seaweedfs:latest
+    command: server -dir=/data -s3 -s3.port=9000 -ip.bind=0.0.0.0
+    volumes: [s3:/data]
+    ports: ["9000:9000"]
+
+  s3-init:
+    image: docker.io/curlimages/curl:latest
+    depends_on: [s3]
+    entrypoint:
+      - sh
+      - -c
+      - until curl -s -o /dev/null -w '%{http_code}' -X PUT http://s3:9000/game-cache | grep -qE '200|409'; do sleep 1; done
+
+  vault:
+    image: docker.io/hashicorp/vault:latest
+    command: server -dev -dev-root-token-id=dev-root -dev-listen-address=0.0.0.0:8200
+    cap_add: [IPC_LOCK]
+    ports: ["8200:8200"]
+
+  game-cacher:
+    image: game-cacher:dev
+    depends_on:
+      s3-init: { condition: service_completed_successfully }
+      vault: { condition: service_started }
+    restart: on-failure
+    environment:
+      LOG: info
+      GC_ADMIN_PASSWORD: admin
+      GC_CACHE_IP: 127.0.0.1
+      GC_UPSTREAM_DNS: 1.1.1.1,8.8.8.8
+      GC_DNS_FORWARD: 1.1.1.1
+      GC_STORAGE: s3
+      GC_S3_BUCKET: game-cache
+      GC_S3_ENDPOINT: http://s3:9000
+      GC_S3_PATH_STYLE: "true"
+      AWS_ACCESS_KEY_ID: any
+      AWS_SECRET_ACCESS_KEY: any
+      GC_SECRETS: vault
+      GC_VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: dev-root
+      GC_CACHE_MAX_SIZE: 50GiB
+    ports:
+      - "5353:53/udp"
+      - "5353:53/tcp"
+      - "8081:80"
+      - "8443:443"
+      - "8080:8080"
