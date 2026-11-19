@@ -87,14 +87,20 @@ pub fn index_keys(data: &[u8]) -> Result<Vec<Vec<u8>>> {
     // Footer: toc_hash[cs], version, 2 reserved, block_size_kb, offset_bytes, size_bytes,
     // key_size, checksum_size, num_elements (LE u32), footer_hash[cs]. checksum_size
     // is 8 in practice but also locates itself, so probe for a consistent value.
+    // Try the usual 8 first: other sizes can match by accident on bytes of the
+    // element count, so a candidate must also have version 1 and a sane key size.
     let len = data.len();
-    let Some(cs) =
-        (1..=16usize).find(|&cs| len >= 12 + 2 * cs && data[len - cs - 5] as usize == cs)
-    else {
+    let plausible = |cs: usize| {
+        if len < 12 + 2 * cs || data[len - cs - 5] as usize != cs {
+            return false;
+        }
+        let f = &data[len - (12 + 2 * cs)..];
+        f[cs] == 1 && (1..=32).contains(&f[cs + 6])
+    };
+    let Some(cs) = std::iter::once(8).chain(1..=16).find(|&cs| plausible(cs)) else {
         bail!("unrecognised archive index footer");
     };
     let footer = &data[len - (12 + 2 * cs)..];
-    ensure!(footer[cs] == 1, "unsupported index version {}", footer[cs]);
     let block_size = footer[cs + 3] as usize * 1024;
     let (offset_bytes, size_bytes, key_size) = (
         footer[cs + 4] as usize,
@@ -283,5 +289,57 @@ mod tests {
         let mut bad = index(&keys);
         bad.drain(..4096);
         assert!(index_keys(&bad).is_err());
+    }
+}
+
+/// Parses real CDN files when `GC_BLIZZARD_SAMPLES` points at a directory holding
+/// `encoding.blte` (BLTE-encoded encoding file) and `archive.index`, fetched from a
+/// live Blizzard CDN. Run with `cargo test -- --ignored live_samples`.
+#[cfg(test)]
+mod live {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn live_samples() {
+        let Ok(dir) = std::env::var("GC_BLIZZARD_SAMPLES") else {
+            return;
+        };
+        let dir = std::path::Path::new(&dir);
+        let enc = decode_blte(&std::fs::read(dir.join("encoding.blte")).unwrap()).unwrap();
+        assert_eq!(&enc[..2], b"EN", "decoded encoding file has EN magic");
+        let ekeys = encoding_ekeys(&enc).unwrap();
+        assert!(ekeys.len() > 100, "encoding ekeys: {}", ekeys.len());
+        assert!(ekeys.iter().all(|k| k.len() == 16));
+        let idx = std::fs::read(dir.join("archive.index")).unwrap();
+        let keys = index_keys(&idx).unwrap();
+        assert!(!keys.is_empty());
+        assert!(keys.iter().all(|k| k.len() == 16));
+        // Entries are sorted by key, which checks the block/entry geometry.
+        assert!(keys.windows(2).all(|w| w[0] < w[1]), "index keys sorted");
+        // Across all of a build's archive indexes (idx/*.index), most encoding
+        // ekeys must be archived; archives also hold other builds' content.
+        let mut archived = std::collections::HashSet::new();
+        if let Ok(entries) = std::fs::read_dir(dir.join("idx")) {
+            for e in entries {
+                archived.extend(index_keys(&std::fs::read(e.unwrap().path()).unwrap()).unwrap());
+            }
+        }
+        if !archived.is_empty() {
+            let covered = ekeys.iter().filter(|k| archived.contains(*k)).count();
+            eprintln!(
+                "encoding ekeys {}, archived {}, loose {}",
+                ekeys.len(),
+                covered,
+                ekeys.len() - covered
+            );
+            for k in ekeys.iter().filter(|k| !archived.contains(*k)).take(5) {
+                eprintln!("loose {}", hex::encode(k));
+            }
+            assert!(
+                covered * 2 > ekeys.len(),
+                "most encoding ekeys are archived"
+            );
+        }
     }
 }
