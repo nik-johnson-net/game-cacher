@@ -33,6 +33,9 @@ pub struct Usage {
 /// (eviction, `remove_object`, `remove_identifier`).
 pub type RemoveHook = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// 1 TiB at the minimum 64 KiB slice size: a bitset of at most 2 MiB per object.
+const MAX_TRACKED_SLICES: u64 = 1 << 24;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Entry {
     identifier: String,
@@ -53,8 +56,13 @@ struct Entry {
 }
 
 impl Entry {
-    /// Sets the bit for `index`; returns true if it was not set before.
+    /// Sets the bit for `index`; returns true if it was not set before. Indices
+    /// beyond `MAX_TRACKED_SLICES` aren't tracked (bounded memory; the warm fast
+    /// path simply won't apply to such objects).
     fn set_slice(&mut self, index: u64) -> bool {
+        if index >= MAX_TRACKED_SLICES {
+            return true;
+        }
         let (word, bit) = ((index / 64) as usize, index % 64);
         if self.slices.len() <= word {
             self.slices.resize(word + 1, 0);
@@ -64,9 +72,14 @@ impl Entry {
         !was
     }
 
-    fn clear_slice(&mut self, index: u64) {
-        if let Some(w) = self.slices.get_mut((index / 64) as usize) {
-            *w &= !(1 << (index % 64));
+    /// Clears the bit for `index`; returns true if it was set.
+    fn clear_slice(&mut self, index: u64) -> bool {
+        match self.slices.get_mut((index / 64) as usize) {
+            Some(w) if *w & (1 << (index % 64)) != 0 => {
+                *w &= !(1 << (index % 64));
+                true
+            }
+            _ => false,
         }
     }
 
@@ -274,10 +287,18 @@ impl LruIndex {
         self.dirty.store(true, Ordering::Relaxed);
     }
 
-    /// Marks a slice as missing (a read found it absent or invalid).
-    pub fn unmark_slice(&self, object_prefix: &str, index: u64) {
-        if let Some(e) = self.lock().objects.get_mut(object_prefix) {
-            e.clear_slice(index);
+    /// Marks a slice as missing (a read found it absent or invalid). If it was
+    /// known as stored, its `bytes` are no longer counted.
+    pub fn unmark_slice(&self, object_prefix: &str, index: u64, bytes: u64) {
+        let mut inner = self.lock();
+        let Some(e) = inner.objects.get_mut(object_prefix) else {
+            return;
+        };
+        if e.clear_slice(index) {
+            e.bytes = e.bytes.saturating_sub(bytes);
+            inner.total = inner.total.saturating_sub(bytes);
+            drop(inner);
+            self.dirty.store(true, Ordering::Relaxed);
         }
     }
 
@@ -444,11 +465,13 @@ impl LruIndex {
         let _guard = self.evicting.lock().await;
         let mut evicted = 0;
         for (prefix, identifier) in self.pick_victims(max) {
+            // Forget first: a slice written while deleting re-registers the object
+            // (tracked again) instead of being left on storage untracked.
+            self.remove_object(&prefix);
             if let Err(e) = self.storage.delete_prefix(&format!("{prefix}/")).await {
                 log::warn!("evicting {prefix}: {e:#}");
                 continue;
             }
-            self.remove_object(&prefix);
             self.metrics.eviction(&identifier);
             evicted += 1;
         }
@@ -675,7 +698,15 @@ mod tests {
         assert!(!idx.has_all_slices(p, 3));
         idx.mark_slice(p, "steam", 2);
         assert!(idx.has_all_slices(p, 3));
-        idx.unmark_slice(p, 1);
+        idx.unmark_slice(p, 1, 100);
+        assert_eq!(idx.usage().total_bytes, 410, "unmarked slice bytes dropped");
+        idx.record_slice(p, "steam", 1, 100);
+        assert_eq!(
+            idx.usage().total_bytes,
+            510,
+            "re-stored once, not double-counted"
+        );
+        idx.unmark_slice(p, 1, 100);
         assert!(!idx.has_all_slices(p, 3));
         // Bits beyond the count are ignored; works across word boundaries.
         for i in 0..130 {

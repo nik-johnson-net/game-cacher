@@ -121,11 +121,31 @@ pub fn is_public(ip: IpAddr) -> bool {
                 return is_public(IpAddr::V4(v4));
             }
             let seg = v6.segments();
+            let embedded = |hi: u16, lo: u16| {
+                IpAddr::V4(std::net::Ipv4Addr::new(
+                    (hi >> 8) as u8,
+                    hi as u8,
+                    (lo >> 8) as u8,
+                    lo as u8,
+                ))
+            };
+            // Addresses that embed an IPv4 address route to it: judge that instead.
+            if seg[..6] == [0x64, 0xff9b, 0, 0, 0, 0] || seg[..6] == [0, 0, 0, 0, 0, 0] {
+                // NAT64 well-known prefix / deprecated IPv4-compatible (::a.b.c.d)
+                return is_public(embedded(seg[6], seg[7]));
+            }
+            if seg[0] == 0x2002 {
+                return is_public(embedded(seg[1], seg[2])); // 6to4
+            }
+            if seg[0] == 0x64 && seg[1] == 0xff9b && seg[2] == 1 {
+                return false; // 64:ff9b:1::/48 local-use NAT64
+            }
             !(v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_multicast()
                 || (seg[0] & 0xfe00) == 0xfc00 // unique local
                 || (seg[0] & 0xffc0) == 0xfe80 // link local
+                || (seg[0] & 0xffc0) == 0xfec0 // site local (deprecated)
                 || (seg[0] == 0x2001 && seg[1] == 0x0db8)) // documentation
         }
     }
@@ -200,17 +220,63 @@ pub struct Upstream {
 
 pub const PROCESSED_BY_HEADER: &str = "x-gamecacher-processed-by";
 
+/// Which redirect targets the upstream client may follow. Names are checked by
+/// the resolver chain; IP-literal targets never reach the resolver, so they are
+/// checked here.
+#[derive(Debug, Clone, Default)]
+pub struct RedirectGuard {
+    pub deny_private: bool,
+    pub own_ips: Vec<IpAddr>,
+}
+
+impl RedirectGuard {
+    /// Err with a reason when a redirect to `url` must not be followed.
+    pub fn check(&self, url: &url::Url) -> std::result::Result<(), String> {
+        let ip = match url.host() {
+            Some(url::Host::Ipv4(v4)) => IpAddr::V4(v4),
+            Some(url::Host::Ipv6(v6)) => IpAddr::V6(v6),
+            _ => return Ok(()),
+        };
+        if self.own_ips.contains(&ip) {
+            return Err(format!("loop detected: redirect to this cache ({ip})"));
+        }
+        if self.deny_private && !is_public(ip) {
+            return Err(format!("redirect to non-public address {ip} refused"));
+        }
+        Ok(())
+    }
+}
+
 impl Upstream {
+    /// Permissive client (no redirect guard); production uses `guarded`.
     pub fn new(
         resolver: Arc<dyn HostResolver>,
         http_port: u16,
         instance_id: String,
     ) -> Result<Self> {
+        Self::guarded(resolver, http_port, instance_id, RedirectGuard::default())
+    }
+
+    pub fn guarded(
+        resolver: Arc<dyn HostResolver>,
+        http_port: u16,
+        instance_id: String,
+        guard: RedirectGuard,
+    ) -> Result<Self> {
+        let policy = reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= 10 {
+                return attempt.error("too many redirects");
+            }
+            match guard.check(attempt.url()) {
+                Ok(()) => attempt.follow(),
+                Err(reason) => attempt.error(reason),
+            }
+        });
         let client = reqwest::Client::builder()
             .dns_resolver(Arc::new(ReqwestAdapter(resolver.clone())))
             .connect_timeout(Duration::from_secs(15))
             .read_timeout(Duration::from_secs(60))
-            .redirect(reqwest::redirect::Policy::limited(10))
+            .redirect(policy)
             .user_agent(concat!("game-cacher/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self {
@@ -279,7 +345,12 @@ mod tests {
 
     #[test]
     fn public_addresses() {
-        for ip in ["1.1.1.1", "151.101.1.1", "2606:4700::1111"] {
+        for ip in [
+            "1.1.1.1",
+            "151.101.1.1",
+            "2606:4700::1111",
+            "64:ff9b::101:101",
+        ] {
             assert!(is_public(ip.parse().unwrap()), "{ip}");
         }
         for ip in [
@@ -298,6 +369,60 @@ mod tests {
         ] {
             assert!(!is_public(ip.parse().unwrap()), "{ip}");
         }
+    }
+
+    #[test]
+    fn redirect_guard() {
+        let g = RedirectGuard {
+            deny_private: true,
+            own_ips: vec!["203.0.113.9".parse().unwrap()],
+        };
+        let u = |s: &str| url::Url::parse(s).unwrap();
+        assert!(
+            g.check(&u("http://cdn.example.com/x")).is_ok(),
+            "names go to the resolver"
+        );
+        assert!(g.check(&u("http://1.1.1.1/x")).is_ok());
+        assert!(g.check(&u("http://169.254.169.254/latest")).is_err());
+        assert!(g.check(&u("http://10.0.0.5:6379/")).is_err());
+        assert!(g.check(&u("http://[::1]/")).is_err());
+        assert!(
+            g.check(&u("http://203.0.113.9/"))
+                .unwrap_err()
+                .contains("loop")
+        );
+        let open = RedirectGuard::default();
+        assert!(open.check(&u("http://10.0.0.5/")).is_ok());
+    }
+
+    #[tokio::test]
+    async fn redirect_to_ip_literal_refused_end_to_end() {
+        use axum::response::Redirect;
+        let router = axum::Router::new().route(
+            "/start",
+            axum::routing::get(|| async { Redirect::temporary("http://127.0.0.1:9/") }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(l, router).await.unwrap() });
+        let guard = RedirectGuard {
+            deny_private: true,
+            own_ips: vec![],
+        };
+        let u = Upstream::guarded(
+            Arc::new(StaticResolver([127, 0, 0, 1].into())),
+            port,
+            "t".into(),
+            guard,
+        )
+        .unwrap();
+        let err = u
+            .client()
+            .get(u.http_url("cdn.example.com", "/start"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("non-public"), "{err:?}");
     }
 
     #[tokio::test]
