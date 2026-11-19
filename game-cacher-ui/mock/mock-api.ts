@@ -268,7 +268,7 @@ function login(platformId: string, m: Managed, req: LoginRequest): LoginResponse
     case "password": {
       if (!req.username || req.password === "wrong") return { status: "failed", message: "invalid username or password" };
       const id = `pw-${++challengeSeq}`;
-      // "phone…" → device confirmation, "totp…" → authenticator code, anything else → emailed code.
+      // "phone…" → device confirmation, "totp…" → authenticator code, anything else → emailed code ("slow…" additionally answers the guard submit with pending).
       if (req.username.startsWith("totp")) {
         challenges.set(id, { platform: platformId, polls: 0, kind: "qr", account: req.username });
         return { status: "guard_required", challenge_id: id, guard_type: "device" };
@@ -284,6 +284,11 @@ function login(platformId: string, m: Managed, req: LoginRequest): LoginResponse
       const c = challenges.get(req.challenge_id);
       if (!c) return { status: "failed", message: "challenge expired" };
       if (req.code !== "12345") return { status: "failed", message: "wrong guard code (the mock accepts 12345)" };
+      // "slow…" → Steam hasn't finished yet: answer pending, then succeed via qr_poll.
+      if (c.account.startsWith("slow")) {
+        c.polls = 0;
+        return { status: "pending", challenge_id: req.challenge_id };
+      }
       challenges.delete(req.challenge_id);
       return loggedIn(m, c.account);
     }
