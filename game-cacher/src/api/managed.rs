@@ -93,6 +93,9 @@ pub async fn selection(
         .collect();
     let mut seen = std::collections::HashSet::new();
     selected.retain(|s| seen.insert(s.clone()));
+    m(&p)
+        .validate_selection(&selected)
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     state
         .settings
         .update(|s| {

@@ -22,7 +22,7 @@ use crate::sni;
 use crate::state::AppState;
 use crate::storage::{self, DynStorage};
 use crate::updates::UpdateManager;
-use crate::upstream::{DnsResolver, HostResolver, LoopGuard, Upstream};
+use crate::upstream::{DnsResolver, HostResolver, LoopGuard, PublicOnly, Upstream};
 
 /// Test seams: anything left `None` is built from config.
 #[derive(Default)]
@@ -82,6 +82,11 @@ pub async fn start(config: Config, env: EnvSecrets, o: Overrides) -> Result<Runn
             let servers: Vec<SocketAddr> = config.upstream_dns.iter().map(|s| s.0).collect();
             Arc::new(DnsResolver::new(&servers)?)
         }
+    };
+    let base_resolver: Arc<dyn HostResolver> = if config.allow_private_upstream {
+        base_resolver
+    } else {
+        Arc::new(PublicOnly(base_resolver))
     };
     let resolver = Arc::new(LoopGuard::new(base_resolver, config.cache_ip.clone()));
     let upstream = Upstream::new(resolver, config.upstream_http_port, config.instance_id())?;

@@ -77,6 +77,60 @@ impl HostResolver for DnsResolver {
     }
 }
 
+/// Wraps a resolver and drops private, loopback, link-local and other non-public
+/// addresses, so the proxy and SNI listener can't be steered into the LAN by a
+/// name that resolves to an internal address. CDNs are always public.
+pub struct PublicOnly(pub Arc<dyn HostResolver>);
+
+#[async_trait]
+impl HostResolver for PublicOnly {
+    async fn resolve(&self, host: &str) -> Result<Vec<IpAddr>> {
+        let addrs: Vec<IpAddr> = self
+            .0
+            .resolve(host)
+            .await?
+            .into_iter()
+            .filter(|a| is_public(*a))
+            .collect();
+        if addrs.is_empty() {
+            anyhow::bail!("{host} resolves only to non-public addresses");
+        }
+        Ok(addrs)
+    }
+}
+
+/// Globally routable unicast address (rough equivalent of the unstable `IpAddr::is_global`).
+pub fn is_public(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.is_documentation()
+                || o[0] == 0
+                || (o[0] == 100 && (o[1] & 0xc0) == 64) // 100.64/10 CGNAT
+                || (o[0] == 198 && (o[1] & 0xfe) == 18) // 198.18/15 benchmarking
+                || o[0] >= 240)
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_public(IpAddr::V4(v4));
+            }
+            let seg = v6.segments();
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (seg[0] & 0xfe00) == 0xfc00 // unique local
+                || (seg[0] & 0xffc0) == 0xfe80 // link local
+                || (seg[0] == 0x2001 && seg[1] == 0x0db8)) // documentation
+        }
+    }
+}
+
 /// Wraps a resolver and drops addresses that are our own cache IPs.
 pub struct LoopGuard {
     inner: Arc<dyn HostResolver>,
@@ -221,6 +275,37 @@ mod tests {
             r.resolve("::1").await.unwrap(),
             vec!["::1".parse::<IpAddr>().unwrap()]
         );
+    }
+
+    #[test]
+    fn public_addresses() {
+        for ip in ["1.1.1.1", "151.101.1.1", "2606:4700::1111"] {
+            assert!(is_public(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in [
+            "10.0.0.1",
+            "172.16.5.4",
+            "192.168.1.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "0.0.0.0",
+            "100.64.0.1",
+            "255.255.255.255",
+            "::1",
+            "fd00::1",
+            "fe80::1",
+            "::ffff:192.168.1.1",
+        ] {
+            assert!(!is_public(ip.parse().unwrap()), "{ip}");
+        }
+    }
+
+    #[tokio::test]
+    async fn public_only() {
+        let r = PublicOnly(Arc::new(StaticResolver("10.0.0.1".parse().unwrap())));
+        assert!(r.resolve("internal.example.com").await.is_err());
+        let r = PublicOnly(Arc::new(StaticResolver("1.1.1.1".parse().unwrap())));
+        assert_eq!(r.resolve("x").await.unwrap().len(), 1);
     }
 
     #[test]

@@ -266,6 +266,7 @@ async fn start_app(content: SocketAddr) -> Harness {
         "127.0.0.1:0",
         "--admin-listen",
         "127.0.0.1:0",
+        "--allow-private-upstream",
         "--cache-ip",
         "10.99.0.1",
         "--slice-size",
