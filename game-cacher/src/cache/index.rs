@@ -152,6 +152,8 @@ pub struct LruIndex {
     dirty: AtomicBool,
     on_remove: RwLock<Option<RemoveHook>>,
     evicting: tokio::sync::Mutex<()>,
+    /// Prefixes being deleted by eviction: reads/writes don't re-register them.
+    evicting_prefixes: Mutex<std::collections::HashSet<String>>,
     /// Woken when a write pushes the total over the limit, so eviction doesn't wait for the tick.
     over_limit: tokio::sync::Notify,
     /// True when the snapshot was loaded (not rebuilt) and should be reconciled with storage.
@@ -210,6 +212,7 @@ impl LruIndex {
             dirty: AtomicBool::new(rebuilt),
             on_remove: RwLock::new(None),
             evicting: tokio::sync::Mutex::new(()),
+            evicting_prefixes: Mutex::new(Default::default()),
             over_limit: tokio::sync::Notify::new(),
             needs_reconcile: AtomicBool::new(!rebuilt),
         }))
@@ -249,8 +252,18 @@ impl LruIndex {
         self.wrote(inner);
     }
 
+    fn is_evicting(&self, object_prefix: &str) -> bool {
+        self.evicting_prefixes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(object_prefix)
+    }
+
     /// Records a stored slice. Rewrites of a slice already known don't add bytes.
     pub fn record_slice(&self, object_prefix: &str, identifier: &str, index: u64, bytes: u64) {
+        if self.is_evicting(object_prefix) {
+            return;
+        }
         let mut inner = self.lock();
         let e = inner.touch(object_prefix, identifier);
         if e.set_slice(index) {
@@ -281,6 +294,9 @@ impl LruIndex {
 
     /// Marks a slice as present (seen on read) and touches the object.
     pub fn mark_slice(&self, object_prefix: &str, identifier: &str, index: u64) {
+        if self.is_evicting(object_prefix) {
+            return;
+        }
         self.lock()
             .touch(object_prefix, identifier)
             .set_slice(index);
@@ -465,10 +481,20 @@ impl LruIndex {
         let _guard = self.evicting.lock().await;
         let mut evicted = 0;
         for (prefix, identifier) in self.pick_victims(max) {
-            // Forget first: a slice written while deleting re-registers the object
-            // (tracked again) instead of being left on storage untracked.
+            // Forget first and block re-registration while deleting, so a racing
+            // read/write can't leave bits or bytes for files that are being removed.
+            // (A slice written mid-delete may survive untracked until reconcile.)
+            self.evicting_prefixes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(prefix.clone());
             self.remove_object(&prefix);
-            if let Err(e) = self.storage.delete_prefix(&format!("{prefix}/")).await {
+            let res = self.storage.delete_prefix(&format!("{prefix}/")).await;
+            self.evicting_prefixes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&prefix);
+            if let Err(e) = res {
                 log::warn!("evicting {prefix}: {e:#}");
                 continue;
             }
@@ -735,6 +761,21 @@ mod tests {
         assert!(!idx.has_all_slices(&k.prefix(), 4), "slice 2 missing");
         assert!(idx.has_all_slices(&k.prefix(), 2));
         assert_eq!(idx.usage().total_bytes, 32);
+    }
+
+    #[tokio::test]
+    async fn evicting_prefix_is_not_re_registered() {
+        let storage: DynStorage = Arc::new(MemoryStorage::new());
+        let idx = index(&storage, None).await;
+        let p = "cache/steam/aa/bb/gone";
+        idx.evicting_prefixes.lock().unwrap().insert(p.to_string());
+        idx.record_slice(p, "steam", 0, 100);
+        idx.mark_slice(p, "steam", 1);
+        assert_eq!(idx.usage().objects, 0);
+        assert!(!idx.has_all_slices(p, 1));
+        idx.evicting_prefixes.lock().unwrap().clear();
+        idx.record_slice(p, "steam", 0, 100);
+        assert_eq!(idx.usage().total_bytes, 100);
     }
 
     #[tokio::test]

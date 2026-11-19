@@ -84,8 +84,8 @@ The API accepts `Authorization: Bearer $GC_ADMIN_PASSWORD` for scripting.
 - **Epic Games**: chunk downloads are cached. To set up managed updates, sign
   in with the authorization code from the link shown in the UI.
 - **Blizzard**: no login is needed. Managed updates prefetch each selected
-  product's archives and the encoding, install, download and size files.
-  Loose files are not prefetched yet.
+  product's archives and indexes, the encoding, install, download and size
+  files, and loose files (encoding keys found in no archive index).
 - **EA app / Origin**: passive caching only, since there is no open download
   protocol to drive pre-downloads.
 - **Windows Update**: passive caching. Specific update files can be prefetched
