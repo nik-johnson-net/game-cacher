@@ -42,3 +42,9 @@ Contract: `docs/ARCHITECTURE.md`.
 ## Phase 5 — Review loop
 - Review subagent compares the requirements (+ clarified decisions) to the implementation and lists divergences.
 - Fix, re-review, until clean.
+
+## Status (2026-11-19)
+All phases complete. Four review rounds against the requirements + clarified decisions:
+round 1 (1 HIGH, 3 MEDIUM), round 2 (2 MEDIUM), round 3 (2 MEDIUM), round 4
+(LOW only) — all fixed. Known accepted limitations are listed in README
+"Platform notes" and docs/ARCHITECTURE.md.
