@@ -229,7 +229,9 @@ impl UpdateManager {
     pub fn spawn_scheduler(self: &Arc<Self>, period: Duration) -> tokio::task::JoinHandle<()> {
         let this = self.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(period);
+            // First check one period after startup, not immediately.
+            let mut interval =
+                tokio::time::interval_at(tokio::time::Instant::now() + period, period);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
