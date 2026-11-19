@@ -9,6 +9,7 @@ pub mod platforms;
 pub mod secrets;
 pub mod settings;
 pub mod sni;
+pub mod state;
 pub mod storage;
 pub mod updates;
 pub mod upstream;
