@@ -1,6 +1,8 @@
 //! Storage abstraction: a flat key → bytes store (disk directory or S3 bucket).
 //! Keys are `/`-separated relative paths (see docs/ARCHITECTURE.md "Storage layout").
 
+#[cfg(test)]
+mod conformance;
 mod disk;
 mod memory;
 mod s3;
