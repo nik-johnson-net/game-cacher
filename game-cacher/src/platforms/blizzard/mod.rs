@@ -1,5 +1,6 @@
 //! Blizzard Battle.net: passive caching plus managed updates (TACT/NGDP prefill).
 
+mod formats;
 mod managed;
 mod tact;
 
