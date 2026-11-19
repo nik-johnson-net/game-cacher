@@ -12,6 +12,8 @@ mod state;
 mod update;
 
 #[cfg(test)]
+mod e2e;
+#[cfg(test)]
 mod tests;
 
 use std::sync::{Arc, OnceLock};
