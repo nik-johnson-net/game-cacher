@@ -219,7 +219,7 @@ impl Epic {
             .iter()
             .find(|a| a.app_name == app)
             .ok_or_else(|| anyhow!("game {app} not found in your Epic library"))?;
-        let mut state = ctx.state.load().await?;
+        let state = ctx.state.load().await?;
         if let Some(t) = state["assets"][app]["title"].as_str() {
             report.name = t.to_string();
         }
@@ -228,9 +228,8 @@ impl Epic {
             .map(String::from);
         report.previous_version = previous.clone();
         report.current_version = Some(asset.build_version.clone());
-        if previous.as_deref() == Some(asset.build_version.as_str()) {
-            return Ok(());
-        }
+        // Every run re-warms all chunks (cache hits when nothing changed), which
+        // verifies the cached data and repairs evicted or purged chunks.
         let entries = self.api(ctx).manifests(&token, asset).await?;
         let (host, pq, base) = pick_manifest(&entries)?;
         let raw = ctx
@@ -240,8 +239,11 @@ impl Epic {
             .context("downloading manifest")?;
         let m = manifest::parse(&raw).context("parsing manifest")?;
         self.warm_all(ctx, &host, &base, &m, report).await;
-        report.updated = true;
-        if report.error.is_none() {
+        let changed = previous.as_deref() != Some(asset.build_version.as_str());
+        report.updated = changed || report.bytes_downloaded > 0;
+        if report.error.is_none() && changed {
+            // Reload: the warm above can take long and other writers may have saved meanwhile.
+            let mut state = ctx.state.load().await?;
             state["games"][app] = json!({"build_version": asset.build_version});
             ctx.state.save(&state).await?;
         }
@@ -317,7 +319,6 @@ impl ManagedUpdates for Epic {
     async fn list_games(&self, ctx: &PlatformCtx) -> Result<Vec<Game>> {
         let token = self.access_token(ctx).await?;
         let assets = self.fresh_assets(ctx, &token).await?;
-        let mut state = ctx.state.load().await?;
         let mut by_ns: BTreeMap<&str, Vec<String>> = BTreeMap::new();
         for a in &assets {
             by_ns
@@ -332,6 +333,8 @@ impl ManagedUpdates for Epic {
                 Err(e) => log::warn!("epic: catalog lookup for namespace {ns} failed: {e:#}"),
             }
         }
+        // Load late: the catalog lookups above are slow and must not clobber other writes.
+        let mut state = ctx.state.load().await?;
         let mut games = Vec::new();
         for a in &assets {
             let cached = state["assets"][&a.app_name]["title"]

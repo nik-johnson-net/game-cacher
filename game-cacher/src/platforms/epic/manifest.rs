@@ -292,9 +292,9 @@ fn parse_json(data: &[u8]) -> Result<Manifest> {
     })
 }
 
-/// Test-only manifest writer producing the binary format `parse` reads.
-#[cfg(test)]
-pub(crate) mod testutil {
+/// Manifest writer producing the binary format `parse` reads (tests only).
+#[doc(hidden)]
+pub mod testutil {
     use super::*;
     use std::io::Write;
 
