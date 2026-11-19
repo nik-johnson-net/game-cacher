@@ -165,6 +165,16 @@ engine in-process (with the platform identifier), so later LAN clients hit.
 | Windows Update | none | user-entered URLs | always (HEAD/size) | GET each URL |
 | Origin | passive only | — | — | — |
 
+### Platform state documents (`state/<platform>.json`)
+
+- steam: `{account, apps: {<appid>: {buildid, depots: {<depotid>: <manifest gid>}}}}`; secret `steam.refresh_token`.
+- epic: `{account, account_id, assets: {...}, games: {<appName>: {build_version}}}`; secret `epic.refresh_token`.
+- blizzard: `{<product>: {build_config, cdn_config, version, updated_at}}`.
+- windowsupdate: `{<url>: {size}}`.
+
+State is only advanced when every object of a run warmed successfully, so
+partial failures are retried on the next run.
+
 ## REST API (admin listener)
 
 All `/api/*` except `POST /api/auth/login` and `GET /api/auth/status` require
