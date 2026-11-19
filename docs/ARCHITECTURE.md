@@ -169,7 +169,7 @@ engine in-process (with the platform identifier), so later LAN clients hit.
 ### Platform state documents (`state/<platform>.json`)
 
 - steam: `{account, apps: {<appid>: {buildid, depots: {<depotid>: <manifest gid>}}}}`; secret `steam.refresh_token`.
-- epic: `{account, account_id, assets: {...}, games: {<appName>: {build_version}}}`; secret `epic.refresh_token`.
+- epic: `{account: {id, display_name}, assets: {<appName>: {namespace, catalog_item_id, build_version, title}}, games: {<appName>: {build_version}}}`; secret `epic.refresh_token`.
 - blizzard: `{<product>: {build_config, cdn_config, version, updated_at}}`.
 - windowsupdate: `{<url>: {size}}`.
 
