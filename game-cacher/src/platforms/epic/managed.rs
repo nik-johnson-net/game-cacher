@@ -92,6 +92,7 @@ impl Epic {
 
     async fn store_login(&self, ctx: &PlatformCtx, t: &client::Token) -> Result<String> {
         ctx.secrets.put(REFRESH_SECRET, &t.refresh_token).await?;
+        let guard = self.state_lock.lock().await;
         let mut state = ctx.state.load().await?;
         let name = match (&t.display_name, state["account"]["display_name"].as_str()) {
             (Some(n), _) => n.clone(),
@@ -100,6 +101,7 @@ impl Epic {
         };
         state["account"] = json!({"id": t.account_id, "display_name": name});
         ctx.state.save(&state).await?;
+        drop(guard);
         *self.token.lock().await = Some(CachedToken {
             access: t.access_token.clone(),
             expires: Instant::now() + Duration::from_secs(t.expires_in),
@@ -110,6 +112,7 @@ impl Epic {
     async fn clear_login(&self, ctx: &PlatformCtx) -> Result<()> {
         ctx.secrets.delete(REFRESH_SECRET).await?;
         *self.token.lock().await = None;
+        let _guard = self.state_lock.lock().await;
         let mut state = ctx.state.load().await?;
         if let Some(o) = state.as_object_mut() {
             o.remove("account");
@@ -161,6 +164,7 @@ impl Epic {
             .filter(is_game)
             .collect();
         assets.dedup_by(|a, b| a.app_name == b.app_name);
+        let _guard = self.state_lock.lock().await;
         let mut state = ctx.state.load().await?;
         let old = state["assets"].clone();
         let mut cache = serde_json::Map::new();
@@ -243,6 +247,7 @@ impl Epic {
         report.updated = changed || report.bytes_downloaded > 0;
         if report.error.is_none() && changed {
             // Reload: the warm above can take long and other writers may have saved meanwhile.
+            let _guard = self.state_lock.lock().await;
             let mut state = ctx.state.load().await?;
             state["games"][app] = json!({"build_version": asset.build_version});
             ctx.state.save(&state).await?;
@@ -334,6 +339,7 @@ impl ManagedUpdates for Epic {
             }
         }
         // Load late: the catalog lookups above are slow and must not clobber other writes.
+        let guard = self.state_lock.lock().await;
         let mut state = ctx.state.load().await?;
         let mut games = Vec::new();
         for a in &assets {
@@ -351,6 +357,7 @@ impl ManagedUpdates for Epic {
             });
         }
         ctx.state.save(&state).await?;
+        drop(guard);
         games.sort_by_key(|g| g.name.to_lowercase());
         Ok(games)
     }

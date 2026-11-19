@@ -125,7 +125,7 @@ impl<'a> Cursor<'a> {
         }
         if len < 0 {
             let n = len.unsigned_abs() as usize;
-            let raw = self.bytes(n * 2)?;
+            let raw = self.bytes(n.checked_mul(2).context("manifest string too long")?)?;
             let units: Vec<u16> = raw
                 .as_chunks::<2>()
                 .0
@@ -189,6 +189,7 @@ fn parse_body(body: &[u8]) -> Result<Manifest> {
     let app_name = c.fstring()?;
     let build_version = c.fstring()?;
     // Remaining meta fields (launch exe, prereqs, ...) are skipped via meta_size.
+    ensure!(meta_size <= body.len(), "meta section size out of range");
     c.pos = meta_size;
     // Chunk data list.
     let _cdl_size = c.u32()?;
@@ -215,7 +216,7 @@ fn parse_body(body: &[u8]) -> Result<Manifest> {
     for ch in &mut chunks {
         ch.hash = c.u64()?;
     }
-    c.bytes(20 * count)?; // sha1 per chunk
+    c.bytes(count.checked_mul(20).context("chunk count overflow")?)?; // sha1 per chunk
     for ch in &mut chunks {
         ch.group = c.u8()?;
     }
@@ -262,7 +263,10 @@ fn parse_json(data: &[u8]) -> Result<Manifest> {
     let sizes = v.get("ChunkFilesizeList").and_then(|x| x.as_object());
     let mut chunks = Vec::with_capacity(hashes.len());
     for (guid_hex, hash) in hashes {
-        ensure!(guid_hex.len() == 32, "bad chunk guid {guid_hex:?}");
+        ensure!(
+            guid_hex.len() == 32 && guid_hex.bytes().all(|b| b.is_ascii_hexdigit()),
+            "bad chunk guid {guid_hex:?}"
+        );
         let mut guid = [0u32; 4];
         for (i, g) in guid.iter_mut().enumerate() {
             *g = u32::from_str_radix(&guid_hex[i * 8..i * 8 + 8], 16)
@@ -463,5 +467,24 @@ mod tests {
         assert_eq!(m.chunks[0].guid, [0x1A2B3C4D, 0, 0xDEADBEEF, 1]);
         assert_eq!(blob_to_num("013000000000").unwrap(), 13);
         assert!(blob_to_num("1234").is_err());
+    }
+
+    #[test]
+    fn json_manifest_rejects_non_ascii_guid() {
+        // 32 bytes, but multi-byte chars straddle every 8-byte slice boundary.
+        let guid = format!("a{}{}", "\u{e9}".repeat(15), "b");
+        assert_eq!(guid.len(), 32);
+        let json = serde_json::json!({
+            "ChunkHashList": { guid.clone(): "136068051085017034017" },
+            "DataGroupList": { guid: 7 }
+        });
+        assert!(parse(json.to_string().as_bytes()).is_err());
+    }
+
+    #[test]
+    fn binary_meta_size_out_of_range_errors() {
+        let mut body = vec![0xFF, 0xFF, 0xFF, 0x7F];
+        body.extend_from_slice(&[0; 64]);
+        assert!(parse_body(&body).is_err());
     }
 }
