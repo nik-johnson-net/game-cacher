@@ -85,7 +85,8 @@ docker/Dockerfile          multi-stage UBI10 image
 
 ```
 settings.json                              SettingsStore (UI-editable settings)
-state/<platform>.json                      managed-update state per platform
+state/<platform>.json                      managed-update state per platform (owned by the platform)
+state/<platform>.runs.json                 last managed-update run (UpdateManager)
 index/lru.json                             LRU index snapshot (object → size, last_access)
 secrets/<name>.enc                         storage-backed secrets (ChaCha20-Poly1305, key from GC_SECRETS_KEY)
 cache/<identifier>/<h[0..2]>/<h[2..4]>/<h>/meta.json   object metadata
@@ -196,14 +197,16 @@ PlatformSummary = { id, name, description, enabled, domains: [str], managed: boo
            storage_bytes, objects } }
 ManagedStatus = { auth: AuthStatus, login_methods: [LoginMethod], selected: [str],
   running: bool, last_run: UpdateRun | null, next_run: rfc3339 | null }
-AuthStatus = { logged_in: bool, account: str | null, required: bool }
+AuthStatus = { logged_in: bool, account: str | null, required: bool, auth_url?: str }
 LoginMethod = "none" | "qr" | "password" | "auth_code" | "manual_list"
 LoginRequest = {"method":"qr"} | {"method":"qr_poll","challenge_id"} |
   {"method":"password","username","password"} | {"method":"guard","challenge_id","code"} |
   {"method":"auth_code","code"}
 LoginResponse = {"status":"logged_in","account"} | {"status":"qr","challenge_id","url"} |
-  {"status":"pending","challenge_id"} | {"status":"guard_required","challenge_id","guard_type":"email"|"device"} |
-  {"status":"failed","message"}  (auth_code responses include "auth_url" hint via ManagedStatus)
+  {"status":"pending","challenge_id"} | {"status":"guard_required","challenge_id","guard_type":"email"|"device"|"device_confirmation"} |
+  {"status":"failed","message"}
+  (device_confirmation: the UI polls with qr_poll + challenge_id; a qr_poll may return a new "qr" url when Steam rotates it)
+AuthStatus.auth_url (optional): where to obtain an auth code (Epic)
 Game = { id, name, version: str | null, size_bytes: u64 | null, selected: bool }
 UpdateRun = { started, finished: rfc3339 | null, games: [UpdateReport] }
 UpdateReport = { game_id, name, previous_version, current_version, updated: bool,
