@@ -361,6 +361,28 @@ async fn mount_manifest_list(f: &Fixture) {
 }
 
 #[tokio::test]
+async fn concurrent_list_and_update_lose_no_state() {
+    let prefill = MockPrefill {
+        manifest: build_manifest("Sugar", "1.0.0", 18, &chunks(), true).into(),
+        ..Default::default()
+    };
+    let f = fixture(prefill).await;
+    login_with_library(&f, "1.0.0").await;
+    mount_manifest_list(&f).await;
+    for _ in 0..5 {
+        let (games, report) = tokio::join!(
+            f.epic.list_games(&f.ctx),
+            f.epic.update_game(&f.ctx, "Sugar"),
+        );
+        games.unwrap();
+        assert_eq!(report.unwrap().error, None);
+        let st = f.ctx.state.load().await.unwrap();
+        assert_eq!(st["games"]["Sugar"]["build_version"], "1.0.0");
+        assert_eq!(st["assets"]["Sugar"]["title"], "Sugar Rush");
+    }
+}
+
+#[tokio::test]
 async fn update_game_warms_every_chunk_then_noops() {
     let prefill = MockPrefill {
         manifest: build_manifest("Sugar", "1.0.0", 18, &chunks(), true).into(),
