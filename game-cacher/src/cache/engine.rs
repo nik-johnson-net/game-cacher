@@ -347,7 +347,7 @@ impl CacheEngine {
         let json = serde_json::to_vec(meta.as_ref()).unwrap_or_default();
         let len = json.len() as u64;
         match self.storage.put(&t.key.meta_key(), Bytes::from(json)).await {
-            Ok(()) => self.index.record_write(&t.prefix, t.identifier(), len),
+            Ok(()) => self.index.record_meta(&t.prefix, t.identifier(), len),
             Err(e) => log::warn!("storing meta for {}: {e:#}", t.prefix),
         }
         self.cache_meta(&t.prefix, meta.clone());
@@ -357,7 +357,9 @@ impl CacheEngine {
     async fn store_slice(&self, t: &Target, index: u64, data: Bytes) {
         let len = data.len() as u64;
         match self.storage.put(&t.key.slice_key(index), data).await {
-            Ok(()) => self.index.record_write(&t.prefix, t.identifier(), len),
+            Ok(()) => self
+                .index
+                .record_slice(&t.prefix, t.identifier(), index, len),
             Err(e) => log::warn!("storing slice {index} of {}: {e:#}", t.prefix),
         }
     }
@@ -455,14 +457,18 @@ impl CacheEngine {
     async fn cached_slice(&self, t: &Target, meta: &Meta, index: u64) -> Option<Bytes> {
         match self.storage.get(&t.key.slice_key(index)).await {
             Ok(Some(b)) if b.len() as u64 == meta.slice_len(index) => {
-                self.index.touch(&t.prefix, t.identifier());
+                self.index.mark_slice(&t.prefix, t.identifier(), index);
                 Some(b)
             }
             Ok(Some(_)) => {
                 log::warn!("slice {index} of {} has the wrong length", t.prefix);
+                self.index.unmark_slice(&t.prefix, index);
                 None
             }
-            Ok(None) => None,
+            Ok(None) => {
+                self.index.unmark_slice(&t.prefix, index);
+                None
+            }
             Err(e) => {
                 log::warn!("reading slice {index} of {}: {e:#}", t.prefix);
                 None
@@ -504,7 +510,9 @@ impl CacheEngine {
             .await
             .unwrap_or(false);
         if stored {
-            self.index.touch(&t.prefix, t.identifier());
+            self.index.mark_slice(&t.prefix, t.identifier(), index);
+        } else {
+            self.index.unmark_slice(&t.prefix, index);
         }
         stored
     }
@@ -683,11 +691,7 @@ impl Prefill for CacheEngine {
                 // Fast path: the index says every slice was written, so skip
                 // per-slice existence checks (a verify pass over a large game
                 // would otherwise cost one storage HEAD per slice).
-                if self
-                    .index
-                    .object_bytes(&t.prefix)
-                    .is_some_and(|b| b >= meta.total_size)
-                {
+                if self.index.has_all_slices(&t.prefix, meta.slice_count()) {
                     self.index.touch(&t.prefix, identifier);
                     r.bytes_already_cached = meta.total_size;
                     return Ok(r);

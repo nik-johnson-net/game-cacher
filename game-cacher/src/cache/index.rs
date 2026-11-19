@@ -33,15 +33,60 @@ pub struct Usage {
 /// (eviction, `remove_object`, `remove_identifier`).
 pub type RemoveHook = Arc<dyn Fn(&str) + Send + Sync>;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Entry {
     identifier: String,
+    /// Slice bytes + `meta_bytes`.
     bytes: u64,
+    /// Size of the object's meta.json (replaced, not added, on rewrite).
+    #[serde(default)]
+    meta_bytes: u64,
     /// Unix seconds.
     last_access: u64,
     /// Tie-breaker within the same second (not persisted).
     #[serde(skip)]
     seq: u64,
+    /// Bitset of slice indices known to be stored. Not persisted: rebuilt from
+    /// storage listings (rebuild/reconcile) and from slice reads/writes.
+    #[serde(skip)]
+    slices: Vec<u64>,
+}
+
+impl Entry {
+    /// Sets the bit for `index`; returns true if it was not set before.
+    fn set_slice(&mut self, index: u64) -> bool {
+        let (word, bit) = ((index / 64) as usize, index % 64);
+        if self.slices.len() <= word {
+            self.slices.resize(word + 1, 0);
+        }
+        let was = self.slices[word] & (1 << bit) != 0;
+        self.slices[word] |= 1 << bit;
+        !was
+    }
+
+    fn clear_slice(&mut self, index: u64) {
+        if let Some(w) = self.slices.get_mut((index / 64) as usize) {
+            *w &= !(1 << (index % 64));
+        }
+    }
+
+    /// Number of set bits below `count`.
+    fn slices_below(&self, count: u64) -> u64 {
+        let full = (count / 64) as usize;
+        let mut n: u64 = self
+            .slices
+            .iter()
+            .take(full)
+            .map(|w| w.count_ones() as u64)
+            .sum();
+        let rem = count % 64;
+        if rem > 0
+            && let Some(w) = self.slices.get(full)
+        {
+            n += (w & ((1u64 << rem) - 1)).count_ones() as u64;
+        }
+        n
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -66,9 +111,7 @@ impl Inner {
             .entry(prefix.to_string())
             .or_insert_with(|| Entry {
                 identifier: identifier.to_string(),
-                bytes: 0,
-                last_access: 0,
-                seq: 0,
+                ..Default::default()
             });
         e.last_access = now_secs();
         e.seq = seq;
@@ -185,17 +228,65 @@ impl LruIndex {
         self.dirty.store(true, Ordering::Relaxed);
     }
 
-    /// Records `bytes` newly stored for an object (slice or meta write) and touches it.
+    /// Records `bytes` newly stored for an object and touches it.
     pub fn record_write(&self, object_prefix: &str, identifier: &str, bytes: u64) {
         let mut inner = self.lock();
         inner.touch(object_prefix, identifier).bytes += bytes;
         inner.total += bytes;
+        self.wrote(inner);
+    }
+
+    /// Records a stored slice. Rewrites of a slice already known don't add bytes.
+    pub fn record_slice(&self, object_prefix: &str, identifier: &str, index: u64, bytes: u64) {
+        let mut inner = self.lock();
+        let e = inner.touch(object_prefix, identifier);
+        if e.set_slice(index) {
+            e.bytes += bytes;
+            inner.total += bytes;
+        }
+        self.wrote(inner);
+    }
+
+    /// Records the object's meta.json size, replacing any previous value.
+    pub fn record_meta(&self, object_prefix: &str, identifier: &str, bytes: u64) {
+        let mut inner = self.lock();
+        let e = inner.touch(object_prefix, identifier);
+        let old = std::mem::replace(&mut e.meta_bytes, bytes);
+        e.bytes = e.bytes - old.min(e.bytes) + bytes;
+        inner.total = inner.total - old.min(inner.total) + bytes;
+        self.wrote(inner);
+    }
+
+    fn wrote(&self, inner: std::sync::MutexGuard<'_, Inner>) {
         let over = self.max_bytes.is_some_and(|m| inner.total > m);
         drop(inner);
         self.dirty.store(true, Ordering::Relaxed);
         if over {
             self.over_limit.notify_one();
         }
+    }
+
+    /// Marks a slice as present (seen on read) and touches the object.
+    pub fn mark_slice(&self, object_prefix: &str, identifier: &str, index: u64) {
+        self.lock()
+            .touch(object_prefix, identifier)
+            .set_slice(index);
+        self.dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Marks a slice as missing (a read found it absent or invalid).
+    pub fn unmark_slice(&self, object_prefix: &str, index: u64) {
+        if let Some(e) = self.lock().objects.get_mut(object_prefix) {
+            e.clear_slice(index);
+        }
+    }
+
+    /// True if every slice `0..count` is known to be stored.
+    pub fn has_all_slices(&self, object_prefix: &str, count: u64) -> bool {
+        self.lock()
+            .objects
+            .get(object_prefix)
+            .is_some_and(|e| e.slices_below(count) == count)
     }
 
     /// Brings a loaded snapshot in line with storage: objects written after the last
@@ -219,11 +310,20 @@ impl LruIndex {
             }
             for (prefix, disk) in on_disk {
                 match inner.objects.get_mut(&prefix) {
-                    Some(e) if e.last_access < started && e.bytes != disk.bytes => {
-                        let old = std::mem::replace(&mut e.bytes, disk.bytes);
-                        inner.total = inner.total - old + disk.bytes;
+                    Some(e) => {
+                        // Slices seen in the listing are present; keep bits set since.
+                        if e.slices.len() < disk.slices.len() {
+                            e.slices.resize(disk.slices.len(), 0);
+                        }
+                        for (w, bits) in e.slices.iter_mut().zip(&disk.slices) {
+                            *w |= bits;
+                        }
+                        if e.last_access < started && e.bytes != disk.bytes {
+                            e.meta_bytes = disk.meta_bytes;
+                            let old = std::mem::replace(&mut e.bytes, disk.bytes);
+                            inner.total = inner.total - old + disk.bytes;
+                        }
                     }
-                    Some(_) => {}
                     None => {
                         inner.total += disk.bytes;
                         inner.objects.insert(prefix, disk);
@@ -268,11 +368,6 @@ impl LruIndex {
         };
         self.dirty.store(true, Ordering::Relaxed);
         self.notify_removed(&removed);
-    }
-
-    /// Bytes recorded for one object (slices + meta), if indexed.
-    pub fn object_bytes(&self, object_prefix: &str) -> Option<u64> {
-        self.lock().objects.get(object_prefix).map(|e| e.bytes)
     }
 
     pub fn usage(&self) -> Usage {
@@ -422,15 +517,20 @@ async fn rebuild(storage: &DynStorage) -> Result<BTreeMap<String, Entry>> {
         let Some((id, prefix)) = object_prefix_of(&info.key) else {
             continue;
         };
-        objects
-            .entry(prefix.to_string())
-            .or_insert_with(|| Entry {
-                identifier: id.to_string(),
-                bytes: 0,
-                last_access: now,
-                seq: 0,
-            })
-            .bytes += info.size;
+        let e = objects.entry(prefix.to_string()).or_insert_with(|| Entry {
+            identifier: id.to_string(),
+            last_access: now,
+            ..Default::default()
+        });
+        e.bytes += info.size;
+        match info.key[prefix.len()..].trim_start_matches('/') {
+            "meta.json" => e.meta_bytes += info.size,
+            name => {
+                if let Ok(i) = name.parse::<u64>() {
+                    e.set_slice(i);
+                }
+            }
+        }
     }
     Ok(objects)
 }
@@ -558,6 +658,52 @@ mod tests {
             "oldest evicted"
         );
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn slice_tracking_is_exact() {
+        let storage: DynStorage = Arc::new(MemoryStorage::new());
+        let idx = index(&storage, None).await;
+        let p = "cache/steam/aa/bb/obj";
+        idx.record_meta(p, "steam", 300);
+        idx.record_slice(p, "steam", 0, 100);
+        idx.record_slice(p, "steam", 0, 100); // rewrite: no extra bytes
+        idx.record_meta(p, "steam", 310); // meta rewrite replaces
+        assert_eq!(idx.usage().total_bytes, 410);
+        // 3 slices, the small last one missing: bytes would suggest "complete" but slices don't.
+        idx.record_slice(p, "steam", 1, 100);
+        assert!(!idx.has_all_slices(p, 3));
+        idx.mark_slice(p, "steam", 2);
+        assert!(idx.has_all_slices(p, 3));
+        idx.unmark_slice(p, 1);
+        assert!(!idx.has_all_slices(p, 3));
+        // Bits beyond the count are ignored; works across word boundaries.
+        for i in 0..130 {
+            idx.mark_slice(p, "steam", i);
+        }
+        assert!(idx.has_all_slices(p, 130));
+        assert!(!idx.has_all_slices(p, 131));
+        assert!(!idx.has_all_slices("cache/steam/aa/bb/none", 1));
+    }
+
+    #[tokio::test]
+    async fn rebuild_restores_slice_bits() {
+        let storage: DynStorage = Arc::new(MemoryStorage::new());
+        let k = ObjectKey::new("epic", "/x");
+        for i in [0u64, 1, 3] {
+            storage
+                .put(&k.slice_key(i), Bytes::from(vec![0u8; 10]))
+                .await
+                .unwrap();
+        }
+        storage
+            .put(&k.meta_key(), Bytes::from_static(b"{}"))
+            .await
+            .unwrap();
+        let idx = index(&storage, None).await;
+        assert!(!idx.has_all_slices(&k.prefix(), 4), "slice 2 missing");
+        assert!(idx.has_all_slices(&k.prefix(), 2));
+        assert_eq!(idx.usage().total_bytes, 32);
     }
 
     #[tokio::test]
