@@ -67,6 +67,8 @@ struct MockPrefill {
     gets: Mutex<Vec<(String, String)>>,
     warmed: Mutex<Vec<(String, String)>>,
     fail_warm: Mutex<HashSet<String>>,
+    /// When set, warms report everything as already cached (nothing downloaded).
+    all_cached: Mutex<bool>,
 }
 
 impl MockPrefill {
@@ -95,6 +97,12 @@ impl Prefill for MockPrefill {
         self.warmed.lock().unwrap().push((host.into(), path.into()));
         if self.fail_warm.lock().unwrap().contains(path) {
             bail!("upstream 503");
+        }
+        if *self.all_cached.lock().unwrap() {
+            return Ok(WarmResult {
+                bytes_downloaded: 0,
+                bytes_already_cached: 1000,
+            });
         }
         Ok(WarmResult {
             bytes_downloaded: 1000,
@@ -872,8 +880,7 @@ async fn full_update_prefetches_unique_chunks_of_selected_depots() {
     );
 }
 
-#[tokio::test]
-async fn unchanged_buildid_is_a_noop() {
+async fn unchanged_harness() -> Harness {
     let h = content_harness(game("555", 1001, 1003)).await;
     h.state
         .save(&serde_json::json!({
@@ -882,18 +889,46 @@ async fn unchanged_buildid_is_a_noop() {
         }))
         .await
         .unwrap();
+    serve_manifest(&h, 101, 1001, &[&[SHA_A, SHA_B]]);
+    serve_manifest(&h, 103, 1003, &[&[SHA_A]]);
+    h
+}
+
+#[tokio::test]
+async fn unchanged_buildid_verifies_cache_and_is_not_an_update() {
+    let h = unchanged_harness().await;
+    *h.prefill.all_cached.lock().unwrap() = true;
     let r = h.managed.update_game(&h.ctx, "100").await.unwrap();
     assert!(!r.updated);
     assert_eq!(r.error, None);
     assert_eq!(r.previous_version.as_deref(), Some("555"));
     assert_eq!(r.current_version.as_deref(), Some("555"));
-    assert!(h.prefill.warmed.lock().unwrap().is_empty());
-    assert!(h.prefill.get_paths().is_empty());
-    assert!(h.backend.code_requests.lock().unwrap().is_empty());
+    assert_eq!(r.files, 3);
+    assert_eq!(r.bytes_downloaded, 0);
+    assert_eq!(r.bytes_already_cached, 3000);
+    assert_eq!(h.prefill.warmed.lock().unwrap().len(), 3);
+    assert_eq!(h.prefill.get_paths().len(), 2);
+    assert_eq!(h.backend.code_requests.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
-async fn partial_change_only_fetches_changed_depots() {
+async fn unchanged_buildid_repairs_evicted_cache() {
+    let h = unchanged_harness().await;
+    let r = h.managed.update_game(&h.ctx, "100").await.unwrap();
+    assert!(r.updated);
+    assert_eq!(r.error, None);
+    assert_eq!(r.files, 3);
+    assert_eq!(r.bytes_downloaded, 3000);
+    assert_eq!(r.previous_version.as_deref(), Some("555"));
+    assert_eq!(r.current_version.as_deref(), Some("555"));
+    assert_eq!(
+        h.state.load().await.unwrap()["apps"]["100"],
+        serde_json::json!({"buildid": "555", "depots": {"101": "1001", "103": "1003"}})
+    );
+}
+
+#[tokio::test]
+async fn partial_change_warms_all_depots() {
     let h = content_harness(game("556", 1001, 2003)).await;
     h.state
         .save(&serde_json::json!({
@@ -902,21 +937,17 @@ async fn partial_change_only_fetches_changed_depots() {
         }))
         .await
         .unwrap();
+    serve_manifest(&h, 101, 1001, &[&[SHA_A]]);
     serve_manifest(&h, 103, 2003, &[&[SHA_B, SHA_C]]);
+    *h.prefill.all_cached.lock().unwrap() = true;
     let r = h.managed.update_game(&h.ctx, "100").await.unwrap();
     assert_eq!(r.error, None);
-    assert!(r.updated);
-    assert_eq!(r.files, 2);
+    assert!(r.updated); // build changed even though nothing was downloaded
+    assert_eq!(r.files, 3);
     assert_eq!(r.previous_version.as_deref(), Some("555"));
     assert_eq!(
         *h.backend.code_requests.lock().unwrap(),
-        vec![(100, 103, 2003)]
-    );
-    assert!(
-        h.prefill
-            .warmed_paths()
-            .iter()
-            .all(|p| p.starts_with("/depot/103/"))
+        vec![(100, 101, 1001), (100, 103, 2003)]
     );
     assert_eq!(
         h.state.load().await.unwrap()["apps"]["100"],
