@@ -16,7 +16,9 @@ pub const IDENTIFIER: &str = "steam";
 /// Concurrent chunk warm-ups per depot.
 const CHUNK_CONCURRENCY: usize = 16;
 
-/// Checks `app_id` against `previous` and prefetches changed depots. Returns the
+/// Checks `app_id` against `previous` and warms every selected depot through the
+/// cache, even when the build id is unchanged: already-cached chunks are cheap
+/// and anything evicted is re-downloaded (verification/repair). Returns the
 /// report and the state to persist. Depot failures are recorded in the report
 /// (first error) and leave that depot's previous gid in place so it is retried;
 /// the new build id is only recorded once every depot succeeded.
@@ -38,13 +40,14 @@ pub async fn update_app(
         current_version: Some(buildid.clone()),
         ..Default::default()
     };
-    if previous.buildid.as_deref() == Some(buildid.as_str()) {
-        return Ok((report, previous.clone()));
-    }
+    let build_changed = previous.buildid.as_deref() != Some(buildid.as_str());
 
     let plans = plan_depots(session, &app).await?;
     let (depots, error) =
         prefill_plans(session, prefill, app_id, &plans, previous, &mut report).await;
+    // A build change, or any bytes fetched while verifying (cache evicted or
+    // purged), counts as an update.
+    report.updated = build_changed || report.bytes_downloaded > 0;
     // Until every depot succeeds, keep the old build id so the next run retries.
     let buildid = if error.is_none() {
         Some(buildid)
@@ -55,7 +58,7 @@ pub async fn update_app(
     Ok((report, AppState { buildid, depots }))
 }
 
-/// Prefetches every plan whose manifest differs from `previous`, accumulating
+/// Prefetches every plan (changed or not, to verify the cache), accumulating
 /// into `report`. Returns the depot → gid map to persist and the first error.
 async fn prefill_plans(
     session: &dyn SteamSession,
@@ -71,10 +74,6 @@ async fn prefill_plans(
     for plan in plans {
         let key = plan.depot_id.to_string();
         let gid = plan.manifest_gid.to_string();
-        if previous.depots.get(&key) == Some(&gid) {
-            depots.insert(key, gid);
-            continue;
-        }
         let result = async {
             let host = match &cdn {
                 Some(h) => h.clone(),
@@ -89,7 +88,6 @@ async fn prefill_plans(
         .await;
         match result {
             Ok(depot) => {
-                report.updated = true;
                 report.files += depot.chunks;
                 report.bytes_downloaded += depot.bytes_downloaded;
                 report.bytes_already_cached += depot.bytes_already_cached;
