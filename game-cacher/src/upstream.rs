@@ -119,10 +119,15 @@ impl reqwest::dns::Resolve for ReqwestAdapter {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let inner = self.0.clone();
         Box::pin(async move {
-            let ips = inner
-                .resolve(name.as_str())
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+            let ips = inner.resolve(name.as_str()).await.map_err(
+                |e| -> Box<dyn std::error::Error + Send + Sync> {
+                    // Keep LoopDetected downcastable through reqwest's error chain.
+                    match e.downcast::<LoopDetected>() {
+                        Ok(l) => Box::new(l),
+                        Err(e) => e.into(),
+                    }
+                },
+            )?;
             let addrs: reqwest::dns::Addrs =
                 Box::new(ips.into_iter().map(|ip| SocketAddr::new(ip, 0)));
             Ok(addrs)

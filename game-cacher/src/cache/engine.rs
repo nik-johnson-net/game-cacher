@@ -67,12 +67,9 @@ pub enum CacheError {
 impl CacheError {
     pub(crate) fn upstream(e: impl Into<anyhow::Error>) -> Self {
         let e = e.into();
-        // The resolver error reaches us through reqwest boxed by anyhow, which hides
-        // the concrete type; fall back to matching LoopDetected's message.
-        let is_loop = e.chain().any(|c| {
-            c.downcast_ref::<LoopDetected>().is_some()
-                || c.to_string().starts_with("loop detected: ")
-        });
+        let is_loop = e
+            .chain()
+            .any(|c| c.downcast_ref::<LoopDetected>().is_some());
         if is_loop {
             CacheError::Loop(format!("{e:#}"))
         } else {
