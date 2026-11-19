@@ -17,10 +17,14 @@ pub struct Meta {
     pub created: String,
 }
 
+/// Largest object we cache (1 TiB). Bigger claims from an upstream are refused so a
+/// hostile `Content-Range` total can't drive slice arithmetic or index memory.
+pub const MAX_OBJECT_SIZE: u64 = 1 << 40;
+
 impl Meta {
     /// Rejects metadata that cannot describe a sliced object.
     pub fn is_valid(&self) -> bool {
-        self.total_size > 0 && self.slice_size > 0
+        self.total_size > 0 && self.total_size <= MAX_OBJECT_SIZE && self.slice_size > 0
     }
 
     pub fn slice_count(&self) -> u64 {
@@ -29,8 +33,11 @@ impl Meta {
 
     /// Inclusive byte bounds of slice `index` (the last slice may be short).
     pub fn slice_bounds(&self, index: u64) -> (u64, u64) {
-        let start = index * self.slice_size;
-        let end = (start + self.slice_size).min(self.total_size) - 1;
+        let start = index.saturating_mul(self.slice_size);
+        let end = start
+            .saturating_add(self.slice_size)
+            .min(self.total_size)
+            .saturating_sub(1);
         (start, end)
     }
 
@@ -68,6 +75,10 @@ mod tests {
         assert_eq!(meta(200, 100).slice_count(), 2);
         assert!(!meta(0, 100).is_valid());
         assert!(!meta(10, 0).is_valid());
+        assert!(!meta(MAX_OBJECT_SIZE + 1, 100).is_valid());
+        let huge = meta(u64::MAX, 1 << 20);
+        let (a, b) = huge.slice_bounds(huge.slice_count() - 1);
+        assert!(a <= b);
     }
 
     #[test]

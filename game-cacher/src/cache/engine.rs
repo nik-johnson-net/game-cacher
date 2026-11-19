@@ -15,7 +15,7 @@ use tokio::sync::OnceCell;
 
 use super::LruIndex;
 use super::key::ObjectKey;
-use super::meta::Meta;
+use super::meta::{MAX_OBJECT_SIZE, Meta};
 use super::range::parse_content_range;
 use crate::metrics::Metrics;
 use crate::platforms::{CachePolicy, Platforms, Prefill, WarmResult};
@@ -215,6 +215,12 @@ pub(crate) fn trim(meta: &Meta, index: u64, bytes: Bytes, a: u64, b: u64) -> Byt
     }
 }
 
+fn too_large(total: u64) -> CacheError {
+    CacheError::Upstream(format!(
+        "object size {total} exceeds the {MAX_OBJECT_SIZE}-byte cache limit"
+    ))
+}
+
 fn header_string(headers: &HeaderMap, name: http::HeaderName) -> Option<String> {
     headers
         .get(name)
@@ -385,6 +391,7 @@ impl CacheEngine {
         match resp.status() {
             StatusCode::PARTIAL_CONTENT => self.probe_partial(t, resp).await,
             StatusCode::OK => match resp.content_length() {
+                Some(n) if n > MAX_OBJECT_SIZE => Err(too_large(n)),
                 Some(n) if n > 0 => {
                     let meta = self.new_meta(t, n, resp.headers());
                     self.store_meta(t, &meta).await;
@@ -407,6 +414,9 @@ impl CacheEngine {
         let Some(cr) = cr else {
             return Ok(ProbeOutcome::Passthrough(resp));
         };
+        if cr.total > MAX_OBJECT_SIZE {
+            return Err(too_large(cr.total));
+        }
         let meta = self.new_meta(t, cr.total, resp.headers());
         if (cr.start, cr.end) != meta.slice_bounds(0) {
             return Err(CacheError::Upstream(format!(
@@ -462,11 +472,13 @@ impl CacheEngine {
             }
             Ok(Some(_)) => {
                 log::warn!("slice {index} of {} has the wrong length", t.prefix);
-                self.index.unmark_slice(&t.prefix, index);
+                self.index
+                    .unmark_slice(&t.prefix, index, meta.slice_len(index));
                 None
             }
             Ok(None) => {
-                self.index.unmark_slice(&t.prefix, index);
+                self.index
+                    .unmark_slice(&t.prefix, index, meta.slice_len(index));
                 None
             }
             Err(e) => {
@@ -503,7 +515,7 @@ impl CacheEngine {
     }
 
     /// True if the slice is stored (touches the object).
-    pub(crate) async fn slice_stored(&self, t: &Target, index: u64) -> bool {
+    pub(crate) async fn slice_stored(&self, t: &Target, meta: &Meta, index: u64) -> bool {
         let stored = self
             .storage
             .exists(&t.key.slice_key(index))
@@ -512,7 +524,8 @@ impl CacheEngine {
         if stored {
             self.index.mark_slice(&t.prefix, t.identifier(), index);
         } else {
-            self.index.unmark_slice(&t.prefix, index);
+            self.index
+                .unmark_slice(&t.prefix, index, meta.slice_len(index));
         }
         stored
     }
@@ -720,7 +733,7 @@ impl Prefill for CacheEngine {
             .map(|i| {
                 let (t, meta) = (&t, &meta);
                 async move {
-                    if self.slice_stored(t, i).await {
+                    if self.slice_stored(t, meta, i).await {
                         return Ok((meta.slice_len(i), true));
                     }
                     self.slice(t, meta, i)

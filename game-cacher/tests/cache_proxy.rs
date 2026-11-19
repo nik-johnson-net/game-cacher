@@ -96,6 +96,16 @@ async fn upstream_handler(State(s): State<FakeCdn>, req: Request) -> Response {
         ["mutable"] => serve_bytes(s.mutable_size.load(Ordering::SeqCst), range, false),
         ["redirect"] => (StatusCode::FOUND, [(LOCATION, "/obj/300000")]).into_response(),
         ["missing"] => (StatusCode::NOT_FOUND, "nope").into_response(),
+        // Claims an absurd total size (2^60 bytes) for its first slice.
+        ["huge"] => (
+            StatusCode::PARTIAL_CONTENT,
+            [(
+                axum::http::header::CONTENT_RANGE,
+                "bytes 0-65535/1152921504606846976",
+            )],
+            vec![0u8; 65536],
+        )
+            .into_response(),
         ["chunked"] => {
             let chunks = vec![Ok::<_, std::io::Error>(Bytes::from(data(1000)))];
             Body::from_stream(futures::stream::iter(chunks)).into_response()
@@ -602,6 +612,19 @@ async fn steam_user_agent_is_not_an_open_relay() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn absurd_upstream_size_is_refused() {
+    let h = harness().await;
+    let resp = h
+        .get(EPIC, "/huge")
+        .header("range", "bytes=1152921504606846975-")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    assert!(h.keys("cache/epic/").await.is_empty(), "nothing cached");
 }
 
 #[tokio::test]

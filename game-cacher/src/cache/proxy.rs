@@ -326,7 +326,7 @@ async fn serve_cached(
     let first = a / meta.slice_size;
     let first_item = match (head, first, fresh) {
         (true, _, fresh) => {
-            let hit = fresh.is_none() && engine.slice_stored(&t, first).await;
+            let hit = fresh.is_none() && engine.slice_stored(&t, &meta, first).await;
             engine.metrics.request(
                 id,
                 if hit {

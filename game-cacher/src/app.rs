@@ -22,7 +22,7 @@ use crate::sni;
 use crate::state::AppState;
 use crate::storage::{self, DynStorage};
 use crate::updates::UpdateManager;
-use crate::upstream::{DnsResolver, HostResolver, LoopGuard, PublicOnly, Upstream};
+use crate::upstream::{DnsResolver, HostResolver, LoopGuard, PublicOnly, RedirectGuard, Upstream};
 
 /// Test seams: anything left `None` is built from config.
 #[derive(Default)]
@@ -89,7 +89,16 @@ pub async fn start(config: Config, env: EnvSecrets, o: Overrides) -> Result<Runn
         Arc::new(PublicOnly(base_resolver))
     };
     let resolver = Arc::new(LoopGuard::new(base_resolver, config.cache_ip.clone()));
-    let upstream = Upstream::new(resolver, config.upstream_http_port, config.instance_id())?;
+    let guard = RedirectGuard {
+        deny_private: !config.allow_private_upstream,
+        own_ips: config.cache_ip.clone(),
+    };
+    let upstream = Upstream::guarded(
+        resolver,
+        config.upstream_http_port,
+        config.instance_id(),
+        guard,
+    )?;
 
     let index =
         LruIndex::load_or_rebuild(storage.clone(), config.cache_max_size, metrics.clone()).await?;
