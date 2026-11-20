@@ -41,6 +41,9 @@ pub struct Steam {
 }
 
 impl Steam {
+    /// Platform identifier (`Platform::id`), also the cache key namespace.
+    pub const ID: &'static str = "steam";
+
     pub fn new() -> Self {
         Self {
             managed: SteamManaged::new(
@@ -59,7 +62,7 @@ impl Default for Steam {
 
 impl Platform for Steam {
     fn id(&self) -> &'static str {
-        "steam"
+        Self::ID
     }
     fn name(&self) -> &'static str {
         "Steam"

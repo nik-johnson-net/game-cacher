@@ -12,7 +12,7 @@ use super::manifest;
 use super::state::AppState;
 use crate::platforms::{Prefill, UpdateReport};
 
-pub const IDENTIFIER: &str = "steam";
+pub const IDENTIFIER: &str = super::Steam::ID;
 /// Concurrent chunk warm-ups per depot.
 const CHUNK_CONCURRENCY: usize = 16;
 

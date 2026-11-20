@@ -13,6 +13,9 @@ pub struct Blizzard {
 }
 
 impl Blizzard {
+    /// Platform identifier (`Platform::id`), also the cache key namespace.
+    pub const ID: &'static str = "blizzard";
+
     pub fn new() -> Self {
         Self::with_patch_base(DEFAULT_PATCH_BASE)
     }
@@ -33,7 +36,7 @@ impl Default for Blizzard {
 
 impl Platform for Blizzard {
     fn id(&self) -> &'static str {
-        "blizzard"
+        Self::ID
     }
     fn name(&self) -> &'static str {
         "Blizzard Battle.net"

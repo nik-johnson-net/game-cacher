@@ -50,6 +50,15 @@ pub trait Platform: Send + Sync + 'static {
 
 pub type DynPlatform = Arc<dyn Platform>;
 
+/// Identifiers of all supported platforms (same order as `all()`).
+pub const IDENTIFIERS: &[&str] = &[
+    steam::Steam::ID,
+    epic::Epic::ID,
+    blizzard::Blizzard::ID,
+    origin::Origin::ID,
+    windows_update::WindowsUpdate::ID,
+];
+
 /// All supported platforms in matching-priority order.
 pub fn all() -> Vec<DynPlatform> {
     vec![
@@ -325,5 +334,11 @@ mod registry_tests {
         );
         assert!(p.identify("example.com", "curl").is_none());
         assert_eq!(p.get("epic").unwrap().name(), "Epic Games");
+    }
+
+    #[test]
+    fn identifiers_match_registry() {
+        let ids: Vec<&str> = all().iter().map(|p| p.id()).collect();
+        assert_eq!(ids, IDENTIFIERS);
     }
 }

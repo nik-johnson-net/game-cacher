@@ -1,5 +1,8 @@
 //! LRU index + eviction. Tracks bytes and last access per cached object in memory,
 //! snapshots to `index/lru.json`, and evicts whole objects oldest-first.
+mod compact;
+mod snapshot;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -7,8 +10,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
-use serde::{Deserialize, Serialize};
 
+use self::compact::{Key, Slices};
 use super::key::object_prefix_of;
 use crate::metrics::Metrics;
 use crate::storage::DynStorage;
@@ -36,23 +39,19 @@ pub type RemoveHook = Arc<dyn Fn(&str) + Send + Sync>;
 /// 1 TiB at the minimum 64 KiB slice size: a bitset of at most 2 MiB per object.
 const MAX_TRACKED_SLICES: u64 = 1 << 24;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default)]
 struct Entry {
-    identifier: String,
     /// Slice bytes + `meta_bytes`.
     bytes: u64,
     /// Size of the object's meta.json (replaced, not added, on rewrite).
-    #[serde(default)]
     meta_bytes: u64,
     /// Unix seconds.
     last_access: u64,
     /// Tie-breaker within the same second (not persisted).
-    #[serde(skip)]
     seq: u64,
-    /// Bitset of slice indices known to be stored. Not persisted: rebuilt from
-    /// storage listings (rebuild/reconcile) and from slice reads/writes.
-    #[serde(skip)]
-    slices: Vec<u64>,
+    /// Slice indices known to be stored. Not persisted: rebuilt from storage
+    /// listings (rebuild/reconcile) and from slice reads/writes.
+    slices: Slices,
 }
 
 impl Entry {
@@ -60,79 +59,29 @@ impl Entry {
     /// beyond `MAX_TRACKED_SLICES` aren't tracked (bounded memory; the warm fast
     /// path simply won't apply to such objects).
     fn set_slice(&mut self, index: u64) -> bool {
-        if index >= MAX_TRACKED_SLICES {
-            return true;
-        }
-        let (word, bit) = ((index / 64) as usize, index % 64);
-        if self.slices.len() <= word {
-            self.slices.resize(word + 1, 0);
-        }
-        let was = self.slices[word] & (1 << bit) != 0;
-        self.slices[word] |= 1 << bit;
-        !was
+        index >= MAX_TRACKED_SLICES || self.slices.set(index)
     }
-
-    /// Clears the bit for `index`; returns true if it was set.
-    fn clear_slice(&mut self, index: u64) -> bool {
-        match self.slices.get_mut((index / 64) as usize) {
-            Some(w) if *w & (1 << (index % 64)) != 0 => {
-                *w &= !(1 << (index % 64));
-                true
-            }
-            _ => false,
-        }
-    }
-
-    /// Number of set bits below `count`.
-    fn slices_below(&self, count: u64) -> u64 {
-        let full = (count / 64) as usize;
-        let mut n: u64 = self
-            .slices
-            .iter()
-            .take(full)
-            .map(|w| w.count_ones() as u64)
-            .sum();
-        let rem = count % 64;
-        if rem > 0
-            && let Some(w) = self.slices.get(full)
-        {
-            n += (w & ((1u64 << rem) - 1)).count_ones() as u64;
-        }
-        n
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct Snapshot {
-    version: u32,
-    objects: BTreeMap<String, Entry>,
 }
 
 #[derive(Default)]
 struct Inner {
-    objects: HashMap<String, Entry>,
+    objects: HashMap<Key, Entry>,
     total: u64,
     seq: u64,
 }
 
 impl Inner {
-    fn touch(&mut self, prefix: &str, identifier: &str) -> &mut Entry {
+    fn touch(&mut self, key: Key) -> &mut Entry {
         self.seq += 1;
         let seq = self.seq;
-        let e = self
-            .objects
-            .entry(prefix.to_string())
-            .or_insert_with(|| Entry {
-                identifier: identifier.to_string(),
-                ..Default::default()
-            });
+        let e = self.objects.entry(key).or_default();
         e.last_access = now_secs();
         e.seq = seq;
         e
     }
 
-    fn remove(&mut self, prefix: &str) -> bool {
-        match self.objects.remove(prefix) {
+    fn remove(&mut self, key: &Key) -> bool {
+        match self.objects.remove(key) {
             Some(e) => {
                 self.total = self.total.saturating_sub(e.bytes);
                 true
@@ -175,8 +124,8 @@ impl LruIndex {
         metrics: Arc<Metrics>,
     ) -> Result<Arc<Self>> {
         let loaded = match storage.get(INDEX_KEY).await.context("reading LRU index")? {
-            Some(bytes) => match serde_json::from_slice::<Snapshot>(&bytes) {
-                Ok(s) => Some(s.objects),
+            Some(bytes) => match snapshot::decode(&bytes) {
+                Ok(o) => Some(o),
                 Err(e) => {
                     log::warn!("corrupt {INDEX_KEY} ({e}), rebuilding from storage");
                     None
@@ -189,15 +138,13 @@ impl LruIndex {
             Some(o) => o,
             None => rebuild(&storage).await?,
         };
-        let mut sorted: Vec<(String, Entry)> = objects.into_iter().collect();
-        sorted.sort_by_key(|(_, e)| e.last_access);
-        let mut inner = Inner::default();
-        for (prefix, mut e) in sorted {
-            inner.seq += 1;
-            e.seq = inner.seq;
-            inner.total += e.bytes;
-            inner.objects.insert(prefix, e);
-        }
+        // Loaded entries share seq 0: ties within a second evict in arbitrary order.
+        let total = objects.values().map(|e| e.bytes).sum();
+        let inner = Inner {
+            objects,
+            total,
+            seq: 0,
+        };
         log::info!(
             "LRU index: {} objects, {} bytes{}",
             inner.objects.len(),
@@ -240,14 +187,20 @@ impl LruIndex {
 
     /// Marks an object as used now.
     pub fn touch(&self, object_prefix: &str, identifier: &str) {
-        self.lock().touch(object_prefix, identifier);
+        if self.is_evicting(object_prefix) {
+            return;
+        }
+        self.lock().touch(Key::new(object_prefix, identifier));
         self.dirty.store(true, Ordering::Relaxed);
     }
 
     /// Records `bytes` newly stored for an object and touches it.
     pub fn record_write(&self, object_prefix: &str, identifier: &str, bytes: u64) {
+        if self.is_evicting(object_prefix) {
+            return;
+        }
         let mut inner = self.lock();
-        inner.touch(object_prefix, identifier).bytes += bytes;
+        inner.touch(Key::new(object_prefix, identifier)).bytes += bytes;
         inner.total += bytes;
         self.wrote(inner);
     }
@@ -265,7 +218,7 @@ impl LruIndex {
             return;
         }
         let mut inner = self.lock();
-        let e = inner.touch(object_prefix, identifier);
+        let e = inner.touch(Key::new(object_prefix, identifier));
         if e.set_slice(index) {
             e.bytes += bytes;
             inner.total += bytes;
@@ -275,8 +228,11 @@ impl LruIndex {
 
     /// Records the object's meta.json size, replacing any previous value.
     pub fn record_meta(&self, object_prefix: &str, identifier: &str, bytes: u64) {
+        if self.is_evicting(object_prefix) {
+            return;
+        }
         let mut inner = self.lock();
-        let e = inner.touch(object_prefix, identifier);
+        let e = inner.touch(Key::new(object_prefix, identifier));
         let old = std::mem::replace(&mut e.meta_bytes, bytes);
         e.bytes = e.bytes - old.min(e.bytes) + bytes;
         inner.total = inner.total - old.min(inner.total) + bytes;
@@ -298,7 +254,7 @@ impl LruIndex {
             return;
         }
         self.lock()
-            .touch(object_prefix, identifier)
+            .touch(Key::new(object_prefix, identifier))
             .set_slice(index);
         self.dirty.store(true, Ordering::Relaxed);
     }
@@ -307,10 +263,10 @@ impl LruIndex {
     /// known as stored, its `bytes` are no longer counted.
     pub fn unmark_slice(&self, object_prefix: &str, index: u64, bytes: u64) {
         let mut inner = self.lock();
-        let Some(e) = inner.objects.get_mut(object_prefix) else {
+        let Some(e) = inner.objects.get_mut(&Key::find(object_prefix)) else {
             return;
         };
-        if e.clear_slice(index) {
+        if e.slices.clear(index) {
             e.bytes = e.bytes.saturating_sub(bytes);
             inner.total = inner.total.saturating_sub(bytes);
             drop(inner);
@@ -322,8 +278,8 @@ impl LruIndex {
     pub fn has_all_slices(&self, object_prefix: &str, count: u64) -> bool {
         self.lock()
             .objects
-            .get(object_prefix)
-            .is_some_and(|e| e.slices_below(count) == count)
+            .get(&Key::find(object_prefix))
+            .is_some_and(|e| e.slices.count_below(count) == count)
     }
 
     /// Brings a loaded snapshot in line with storage: objects written after the last
@@ -335,26 +291,21 @@ impl LruIndex {
         let (mut added, mut removed) = (0, Vec::new());
         {
             let mut inner = self.lock();
-            let stale: Vec<String> = inner
+            let stale: Vec<Key> = inner
                 .objects
                 .iter()
-                .filter(|(p, e)| e.last_access < started && !on_disk.contains_key(*p))
-                .map(|(p, _)| p.clone())
+                .filter(|(k, e)| e.last_access < started && !on_disk.contains_key(*k))
+                .map(|(k, _)| k.clone())
                 .collect();
-            for p in stale {
-                inner.remove(&p);
-                removed.push(p);
+            for k in stale {
+                inner.remove(&k);
+                removed.push(k);
             }
-            for (prefix, disk) in on_disk {
-                match inner.objects.get_mut(&prefix) {
+            for (key, disk) in on_disk {
+                match inner.objects.get_mut(&key) {
                     Some(e) => {
                         // Slices seen in the listing are present; keep bits set since.
-                        if e.slices.len() < disk.slices.len() {
-                            e.slices.resize(disk.slices.len(), 0);
-                        }
-                        for (w, bits) in e.slices.iter_mut().zip(&disk.slices) {
-                            *w |= bits;
-                        }
+                        e.slices.union(&disk.slices);
                         if e.last_access < started && e.bytes != disk.bytes {
                             e.meta_bytes = disk.meta_bytes;
                             let old = std::mem::replace(&mut e.bytes, disk.bytes);
@@ -363,7 +314,7 @@ impl LruIndex {
                     }
                     None => {
                         inner.total += disk.bytes;
-                        inner.objects.insert(prefix, disk);
+                        inner.objects.insert(key, disk);
                         added += 1;
                     }
                 }
@@ -375,6 +326,7 @@ impl LruIndex {
                 removed.len()
             );
             self.dirty.store(true, Ordering::Relaxed);
+            let removed: Vec<String> = removed.iter().map(Key::prefix).collect();
             self.notify_removed(&removed);
         }
         Ok(())
@@ -382,7 +334,7 @@ impl LruIndex {
 
     /// Forgets an object (after it was deleted from storage).
     pub fn remove_object(&self, object_prefix: &str) {
-        if self.lock().remove(object_prefix) {
+        if self.lock().remove(&Key::find(object_prefix)) {
             self.dirty.store(true, Ordering::Relaxed);
         }
         self.notify_removed(&[object_prefix.to_string()]);
@@ -390,60 +342,50 @@ impl LruIndex {
 
     /// Forgets all objects of an identifier (after a platform purge).
     pub fn remove_identifier(&self, identifier: &str) {
-        let removed: Vec<String> = {
+        let removed: Vec<Key> = {
             let mut inner = self.lock();
-            let prefixes: Vec<String> = inner
+            let keys: Vec<Key> = inner
                 .objects
                 .iter()
-                .filter(|(_, e)| e.identifier == identifier)
-                .map(|(p, _)| p.clone())
+                .filter(|(k, _)| k.identifier() == identifier)
+                .map(|(k, _)| k.clone())
                 .collect();
-            prefixes.iter().for_each(|p| {
-                inner.remove(p);
+            keys.iter().for_each(|k| {
+                inner.remove(k);
             });
-            prefixes
+            keys
         };
         self.dirty.store(true, Ordering::Relaxed);
+        let removed: Vec<String> = removed.iter().map(Key::prefix).collect();
         self.notify_removed(&removed);
     }
 
     pub fn usage(&self) -> Usage {
         let inner = self.lock();
-        let mut usage = Usage {
-            total_bytes: inner.total,
-            objects: inner.objects.len() as u64,
-            per_identifier: BTreeMap::new(),
-        };
-        for e in inner.objects.values() {
-            let u = usage
-                .per_identifier
-                .entry(e.identifier.clone())
-                .or_default();
+        let mut per_id: BTreeMap<&str, IdentifierUsage> = BTreeMap::new();
+        for (k, e) in &inner.objects {
+            let u = per_id.entry(k.identifier()).or_default();
             u.bytes += e.bytes;
             u.objects += 1;
         }
-        usage
+        Usage {
+            total_bytes: inner.total,
+            objects: inner.objects.len() as u64,
+            per_identifier: per_id
+                .into_iter()
+                .map(|(id, u)| (id.to_string(), u))
+                .collect(),
+        }
     }
 
     pub fn max_bytes(&self) -> Option<u64> {
         self.max_bytes
     }
 
-    /// Writes `index/lru.json`.
+    /// Writes `index/lru.json`, serialized straight from the in-memory map.
     pub async fn snapshot(&self) -> Result<()> {
         self.dirty.store(false, Ordering::Relaxed);
-        let json = {
-            let inner = self.lock();
-            let snap = Snapshot {
-                version: 1,
-                objects: inner
-                    .objects
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-            };
-            serde_json::to_vec(&snap)?
-        };
+        let json = snapshot::encode(&self.lock().objects)?;
         let res = self.storage.put(INDEX_KEY, Bytes::from(json)).await;
         if res.is_err() {
             self.dirty.store(true, Ordering::Relaxed);
@@ -458,16 +400,16 @@ impl LruIndex {
             return Vec::new();
         }
         let target = (max as u128 * 9 / 10) as u64;
-        let mut entries: Vec<(&String, &Entry)> = inner.objects.iter().collect();
+        let mut entries: Vec<(&Key, &Entry)> = inner.objects.iter().collect();
         entries.sort_by_key(|(_, e)| (e.last_access, e.seq));
         let mut total = inner.total;
         let mut victims = Vec::new();
-        for (prefix, e) in entries {
+        for (key, e) in entries {
             if total <= target {
                 break;
             }
             total = total.saturating_sub(e.bytes);
-            victims.push((prefix.clone(), e.identifier.clone()));
+            victims.push((key.prefix(), key.identifier().to_string()));
         }
         victims
     }
@@ -559,18 +501,19 @@ impl LruIndex {
 }
 
 /// Rebuilds the index by listing every key under `cache/`.
-async fn rebuild(storage: &DynStorage) -> Result<BTreeMap<String, Entry>> {
+async fn rebuild(storage: &DynStorage) -> Result<HashMap<Key, Entry>> {
     let now = now_secs();
-    let mut objects: BTreeMap<String, Entry> = BTreeMap::new();
+    let mut objects: HashMap<Key, Entry> = HashMap::new();
     for info in storage.list("cache/").await.context("listing cache/")? {
         let Some((id, prefix)) = object_prefix_of(&info.key) else {
             continue;
         };
-        let e = objects.entry(prefix.to_string()).or_insert_with(|| Entry {
-            identifier: id.to_string(),
-            last_access: now,
-            ..Default::default()
-        });
+        let e = objects
+            .entry(Key::new(prefix, id))
+            .or_insert_with(|| Entry {
+                last_access: now,
+                ..Default::default()
+            });
         e.bytes += info.size;
         match info.key[prefix.len()..].trim_start_matches('/') {
             "meta.json" => e.meta_bytes += info.size,
@@ -674,12 +617,16 @@ mod tests {
             "stale snapshot before reconcile"
         );
         // Make the loaded entry look older than the reconcile start.
-        idx.lock().objects.get_mut(&a).unwrap().last_access = 1;
+        idx.lock()
+            .objects
+            .get_mut(&Key::find(&a))
+            .unwrap()
+            .last_access = 1;
         idx.reconcile().await.unwrap();
         let u = idx.usage();
         assert_eq!((u.total_bytes, u.objects), (52, 1));
         assert!(u.per_identifier.contains_key("epic"));
-        assert!(idx.lock().objects.contains_key(&b));
+        assert!(idx.lock().objects.contains_key(&Key::find(&b)));
     }
 
     #[tokio::test]
@@ -771,6 +718,9 @@ mod tests {
         idx.evicting_prefixes.lock().unwrap().insert(p.to_string());
         idx.record_slice(p, "steam", 0, 100);
         idx.mark_slice(p, "steam", 1);
+        idx.record_meta(p, "steam", 300);
+        idx.record_write(p, "steam", 10);
+        idx.touch(p, "steam");
         assert_eq!(idx.usage().objects, 0);
         assert!(!idx.has_all_slices(p, 1));
         idx.evicting_prefixes.lock().unwrap().clear();
