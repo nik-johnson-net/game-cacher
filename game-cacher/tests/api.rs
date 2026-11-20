@@ -642,28 +642,38 @@ async fn settings_and_ui_fallback() {
     use reqwest::Method;
     assert_eq!(
         h.get("/api/settings").await.1,
-        json!({"update_interval_minutes": 360})
+        json!({"update_schedule": {"timezone": "UTC", "times": ["03:00"]}})
     );
+    // Times are sorted and de-duplicated.
     let (s, v) = h
         .send(
             Method::PUT,
             "/api/settings",
-            json!({"update_interval_minutes": 60}),
+            json!({"update_schedule": {"timezone": "Europe/London", "times": ["16:00", "02:00", "16:00"]}}),
         )
         .await;
-    assert_eq!(
-        (s, v),
-        (StatusCode::OK, json!({"update_interval_minutes": 60}))
-    );
+    let saved =
+        json!({"update_schedule": {"timezone": "Europe/London", "times": ["02:00", "16:00"]}});
+    assert_eq!((s, v), (StatusCode::OK, saved.clone()));
+    assert_eq!(h.get("/api/settings").await.1, saved);
+    for bad in [
+        json!({"update_schedule": {"timezone": "Mars/Olympus", "times": ["02:00"]}}),
+        json!({"update_schedule": {"timezone": "UTC", "times": ["25:00"]}}),
+    ] {
+        let (s, v) = h.send(Method::PUT, "/api/settings", bad).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        assert!(v["error"].is_string());
+    }
+    // An empty schedule means manual runs only.
     let (s, v) = h
         .send(
             Method::PUT,
             "/api/settings",
-            json!({"update_interval_minutes": 1}),
+            json!({"update_schedule": {"timezone": "UTC", "times": []}}),
         )
         .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST);
-    assert!(v["error"].is_string());
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["update_schedule"]["times"], json!([]));
 
     let page = h
         .client

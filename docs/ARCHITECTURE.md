@@ -44,6 +44,7 @@ game-cacher/src/
   sni.rs                   SNI passthrough
   metrics.rs               prometheus-client registry + typed metric families
   platforms/{mod,domains,steam/,epic/,blizzard/,origin,windows_update}.rs
+  schedule.rs              daily update schedule (times of day in an IANA timezone)
   updates.rs               managed-update scheduler + job runner
   api/{mod,auth,platforms,managed,status,settings}.rs
 game-cacher/tests/         integration tests (real listeners + reqwest)
@@ -113,10 +114,13 @@ lancache, so CDN tokens don't fragment the cache). `identifier` = platform id
     "blizzard": { "selected": ["wow", "pro"] },
     "windowsupdate": { "selected": ["http://download.windowsupdate.com/.../x.cab"] }
   },
-  "update_interval_minutes": 360
+  "update_schedule": { "timezone": "Europe/London", "times": ["02:00", "16:00"], "changed": "2026-11-20T15:00:00Z" }
 }
 ```
 Unknown/missing platforms default to enabled; missing `managed` entries default to empty.
+`update_schedule` defaults to `{"timezone": "UTC", "times": ["03:00"]}`; `times` are
+sorted, unique `HH:MM` and empty means manual runs only. `changed` is set by the
+server when the timezone or times change. The retired `update_interval_minutes` is ignored.
 
 ## Cache engine semantics (modelled on lancache/monolithic)
 
@@ -182,6 +186,16 @@ verifies it against the cache: unchanged content costs only in-memory index
 lookups, and anything evicted or purged is downloaded again (`updated: true`
 with `bytes_downloaded > 0`). Prefill and runs are refused for disabled platforms.
 
+Scheduling (`schedule.rs`, checked every 60s by `UpdateManager::tick`): the
+schedule fires every day at each of `times`, read as wall-clock time in
+`timezone` (a time in a DST gap shifts forward by the gap; in an overlap the
+first occurrence fires). A platform that is enabled, has a selection and is
+logged in (if required) is due when it has never run, or when the latest
+trigger is after both the last run's `started` and the schedule's `changed`.
+So missed triggers (e.g. downtime) are caught up once, but editing the
+schedule only moves the next run. `next_run` is now when due, else the next
+trigger.
+
 | Platform | Login | Games list | Update check | Prefill |
 |---|---|---|---|---|
 | Steam | QR or password+Guard (CM via steam-vent), refresh token in secrets | licenses → PICS | PICS buildid / manifest gid per depot | manifest → `/depot/<id>/chunk/<sha>` |
@@ -224,8 +238,8 @@ Errors: `{"error": "message"}` with appropriate status.
 | GET | `/api/platforms/{id}/managed/games` | `[Game]` |
 | PUT | `/api/platforms/{id}/managed/selection` | `{"selected":[game_id]}` → `ManagedStatus` (400 if the platform rejects an entry, e.g. a non-WU URL) |
 | POST | `/api/platforms/{id}/managed/run` | start update run now → 202 `{"started": true}` (409 if running or the platform is disabled) |
-| GET | `/api/settings` | `{"update_interval_minutes"}` |
-| PUT | `/api/settings` | `{"update_interval_minutes"}` → same |
+| GET | `/api/settings` | `{"update_schedule":{"timezone","times":["HH:MM"]}}` |
+| PUT | `/api/settings` | same → same, normalized (400 on an unknown IANA timezone or a malformed time) |
 
 ```
 PlatformSummary = { id, name, description, enabled, domains: [str], managed: bool,

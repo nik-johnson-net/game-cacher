@@ -6,6 +6,7 @@ pub mod dns;
 pub mod error;
 pub mod metrics;
 pub mod platforms;
+pub mod schedule;
 pub mod secrets;
 pub mod settings;
 pub mod sni;

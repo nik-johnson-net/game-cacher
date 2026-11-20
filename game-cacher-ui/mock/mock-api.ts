@@ -17,6 +17,7 @@ import type {
   PlatformSummary,
   UpdateReport,
   UpdateRun,
+  UpdateSchedule,
 } from "../src/api/types";
 
 const GB = 1e9;
@@ -37,7 +38,7 @@ class HttpError extends Error {
 const AUTH_ENABLED = process.env.MOCK_AUTH === "1";
 const PASSWORD = "admin";
 const COOKIE = "gc_session=mock";
-let updateIntervalMinutes = 60;
+let updateSchedule: UpdateSchedule = { timezone: "UTC", times: ["02:00", "16:00"] };
 const startedAt = Date.now() - 5 * 3600_000;
 
 type Managed = {
@@ -49,7 +50,7 @@ type Managed = {
   selected: string[];
   runningUntil: number;
   lastRun: UpdateRun | null;
-  nextRun: number;
+  nextRun: number | null;
   games: Omit<Game, "selected">[];
 };
 
@@ -204,11 +205,40 @@ function summary(p: Platform): PlatformSummary {
   return rest;
 }
 
+/** Validates a PUT /api/settings body like the server: known timezone, HH:MM times, sorted and unique. */
+function parseSchedule(body: unknown): UpdateSchedule {
+  const sched = isRecord(body) ? body.update_schedule : undefined;
+  if (!isRecord(sched) || typeof sched.timezone !== "string" || !Array.isArray(sched.times)) {
+    throw new HttpError(400, "update_schedule must have a timezone and times");
+  }
+  const { timezone, times } = sched;
+  if (timezone !== "UTC" && !Intl.supportedValuesOf("timeZone").includes(timezone)) {
+    throw new HttpError(400, `unknown timezone "${timezone}"`);
+  }
+  for (const t of times) {
+    if (typeof t !== "string" || !/^([01]\d|2[0-3]):[0-5]\d$/.test(t)) throw new HttpError(400, `invalid time ${JSON.stringify(t)}, expected HH:MM`);
+  }
+  return { timezone, times: [...new Set(times as string[])].sort() };
+}
+
+/** Next scheduled run. Approximation: the mock reads the times as UTC whatever the timezone. */
+function nextTrigger(): number | null {
+  const now = new Date();
+  const candidates = [0, 1].flatMap((day) =>
+    updateSchedule.times.map((t) => {
+      const [h, m] = t.split(":").map(Number);
+      return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + day, h, m);
+    }),
+  );
+  const future = candidates.filter((c) => c > now.getTime());
+  return future.length ? Math.min(...future) : null;
+}
+
 /** Finishes a run whose timer elapsed, producing a plausible report. */
 function settleRun(m: Managed, p: Platform) {
   if (m.runningUntil === 0 || Date.now() < m.runningUntil) return;
   m.runningUntil = 0;
-  m.nextRun = Date.now() + updateIntervalMinutes * 60_000;
+  m.nextRun = nextTrigger();
   const started = new Date(Date.now() - 6000).toISOString();
   const reports: UpdateReport[] = m.selected.map((sel, i) => {
     const g = m.games.find((x) => x.id === sel);
@@ -238,7 +268,7 @@ function managedStatus(p: Platform, m: Managed): ManagedStatus {
     selected: m.selected,
     running: m.runningUntil > Date.now(),
     last_run: m.lastRun,
-    next_run: new Date(m.nextRun).toISOString(),
+    next_run: m.nextRun === null ? null : new Date(m.nextRun).toISOString(),
   };
 }
 
@@ -340,12 +370,8 @@ async function route(method: string, path: string, body: unknown): Promise<Handl
     return { body: status };
   }
   if (path === "/api/settings") {
-    if (method === "PUT") {
-      const n = isRecord(body) ? body.update_interval_minutes : undefined;
-      if (typeof n !== "number" || !Number.isInteger(n) || n < 1) throw new HttpError(400, "update_interval_minutes must be a whole number >= 1");
-      updateIntervalMinutes = n;
-    }
-    return { body: { update_interval_minutes: updateIntervalMinutes } };
+    if (method === "PUT") updateSchedule = parseSchedule(body);
+    return { body: { update_schedule: updateSchedule } };
   }
   if (path === "/api/platforms") {
     for (const p of platforms) if (p.enabled) tick(p);
