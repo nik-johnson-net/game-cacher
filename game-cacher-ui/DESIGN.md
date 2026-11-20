@@ -69,4 +69,4 @@ Header with enabled badge, managed badge and "Purge cache" (confirm dialog; toas
 - **Update runs**: Run now (409 → "already running" toast), running badge, next run time, last-run table (game, previous → current version, result badge, downloaded, already cached, files, error). Polls every 2 s while running.
 
 ### Settings `/settings`
-Update interval (minutes) form (`GET/PUT /api/settings`) and a read-only note that storage, secrets and DNS come from env vars / flags.
+Managed-update schedule form (daily times + timezone) (`GET/PUT /api/settings`) and a read-only note that storage, secrets and DNS come from env vars / flags.

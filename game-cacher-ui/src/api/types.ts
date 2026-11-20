@@ -104,4 +104,6 @@ export type Game = {
   selected: boolean;
 };
 
-export type Settings = { update_interval_minutes: number };
+/** Daily managed-update times (`HH:MM`, sorted) in an IANA timezone; empty times = manual runs only. */
+export type UpdateSchedule = { timezone: string; times: string[] };
+export type Settings = { update_schedule: UpdateSchedule };

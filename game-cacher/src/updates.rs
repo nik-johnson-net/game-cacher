@@ -1,6 +1,6 @@
 //! Managed-update scheduler and run tracking. Each managed platform's selected
-//! games are updated every `update_interval_minutes`; run history is kept in
-//! `state/<platform>.runs.json`.
+//! games are updated at the times in `update_schedule` (see `schedule`); run
+//! history is kept in `state/<platform>.runs.json`.
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -108,10 +108,9 @@ impl UpdateManager {
         {
             None
         } else {
-            Some(next_due(
-                last_run.as_ref(),
-                settings.update_interval_minutes,
-            ))
+            settings
+                .update_schedule
+                .next_run(last_run.as_ref().map(|r| r.started), Utc::now())
         };
         Ok(ManagedStatus {
             auth,
@@ -220,7 +219,10 @@ impl UpdateManager {
                     continue;
                 }
             };
-            if next_due(last.as_ref(), settings.update_interval_minutes) > Utc::now() {
+            if !settings
+                .update_schedule
+                .is_due(last.map(|r| r.started), Utc::now())
+            {
                 continue;
             }
             match managed.auth_status(&self.ctx(id)).await {
@@ -259,33 +261,5 @@ impl Drop for RunningGuard {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&self.1);
-    }
-}
-
-/// Next scheduled run: `interval` after the last run started; now if never run.
-fn next_due(last: Option<&UpdateRun>, interval_minutes: u32) -> DateTime<Utc> {
-    match last {
-        Some(r) => r.started + chrono::Duration::minutes(interval_minutes as i64),
-        None => Utc::now(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn due_calculation() {
-        let now = Utc::now();
-        assert!(next_due(None, 60) <= Utc::now());
-        let run = UpdateRun {
-            started: now,
-            finished: None,
-            games: vec![],
-        };
-        assert_eq!(
-            next_due(Some(&run), 60),
-            now + chrono::Duration::minutes(60)
-        );
     }
 }

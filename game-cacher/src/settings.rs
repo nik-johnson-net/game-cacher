@@ -7,14 +7,14 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::RwLock;
 
 use crate::platforms::StateStore;
+use crate::schedule::Schedule;
 use crate::storage::DynStorage;
 
 const SETTINGS_KEY: &str = "settings.json";
-pub const DEFAULT_UPDATE_INTERVAL_MINUTES: u32 = 360;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlatformSettings {
@@ -28,24 +28,14 @@ pub struct ManagedSettings {
     pub selected: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
     pub platforms: BTreeMap<String, PlatformSettings>,
     #[serde(default)]
     pub managed: BTreeMap<String, ManagedSettings>,
-    #[serde(default = "default_interval")]
-    pub update_interval_minutes: u32,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            platforms: BTreeMap::new(),
-            managed: BTreeMap::new(),
-            update_interval_minutes: DEFAULT_UPDATE_INTERVAL_MINUTES,
-        }
-    }
+    #[serde(default, deserialize_with = "lenient_schedule")]
+    pub update_schedule: Schedule,
 }
 
 impl Settings {
@@ -66,8 +56,26 @@ fn default_true() -> bool {
     true
 }
 
-fn default_interval() -> u32 {
-    DEFAULT_UPDATE_INTERVAL_MINUTES
+/// A schedule this build can't read (a hand edit, or a timezone from a newer
+/// tz database) falls back to the default instead of failing startup.
+fn lenient_schedule<'de, D: Deserializer<'de>>(d: D) -> Result<Schedule, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(value).unwrap_or_else(|e| {
+        log::warn!("settings.json: unreadable update_schedule ({e}), using the default");
+        Schedule::default()
+    }))
+}
+
+fn parse_settings(bytes: &[u8]) -> Result<Settings> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).context("parsing settings.json")?;
+    if value.get("update_interval_minutes").is_some() {
+        log::warn!(
+            "settings.json: update_interval_minutes is no longer used; managed updates follow \
+             update_schedule (default 03:00 UTC), set the times on the Settings page"
+        );
+    }
+    serde_json::from_value(value).context("parsing settings.json")
 }
 
 /// Cached settings document with write-through persistence.
@@ -79,7 +87,7 @@ pub struct SettingsStore {
 impl SettingsStore {
     pub async fn load(storage: DynStorage) -> Result<Self> {
         let current = match storage.get(SETTINGS_KEY).await? {
-            Some(bytes) => serde_json::from_slice(&bytes).context("parsing settings.json")?,
+            Some(bytes) => parse_settings(&bytes)?,
             None => Settings::default(),
         };
         Ok(Self {
@@ -147,7 +155,7 @@ mod tests {
         let storage: DynStorage = Arc::new(MemoryStorage::new());
         let s = SettingsStore::load(storage.clone()).await.unwrap();
         assert!(s.get().await.platform_enabled("steam"));
-        assert_eq!(s.get().await.update_interval_minutes, 360);
+        assert_eq!(s.get().await.update_schedule, Schedule::default());
 
         s.update(|s| {
             s.platforms
@@ -158,6 +166,8 @@ mod tests {
                     selected: vec!["Fortnite".into()],
                 },
             );
+            s.update_schedule = Schedule::parse("Europe/London", &["02:00", "16:00"]).unwrap();
+            s.update_schedule.changed = Some(chrono::Utc::now());
         })
         .await
         .unwrap();
@@ -170,6 +180,8 @@ mod tests {
         assert!(!reloaded.platform_enabled("steam"));
         assert_eq!(reloaded.selected("epic"), vec!["Fortnite".to_string()]);
         assert!(reloaded.selected("steam").is_empty());
+        assert_eq!(reloaded.update_schedule, s.get().await.update_schedule);
+        assert_eq!(reloaded.update_schedule.times.len(), 2);
     }
 
     #[tokio::test]
@@ -178,7 +190,7 @@ mod tests {
         storage
             .put(
                 SETTINGS_KEY,
-                Bytes::from_static(br#"{"platforms":{"epic":{}}}"#),
+                Bytes::from_static(br#"{"platforms":{"epic":{}},"update_interval_minutes":60}"#),
             )
             .await
             .unwrap();
@@ -188,7 +200,26 @@ mod tests {
             .get()
             .await;
         assert!(s.platform_enabled("epic"));
-        assert_eq!(s.update_interval_minutes, 360);
+        // The retired interval setting is ignored in favour of the default schedule.
+        assert_eq!(s.update_schedule, Schedule::default());
+
+        // An unreadable schedule falls back to the default; the rest still loads.
+        storage
+            .put(
+                SETTINGS_KEY,
+                Bytes::from_static(
+                    br#"{"platforms":{"epic":{"enabled":false}},"update_schedule":{"timezone":"Mars/Olympus","times":["03:00"]}}"#,
+                ),
+            )
+            .await
+            .unwrap();
+        let s = SettingsStore::load(storage.clone())
+            .await
+            .unwrap()
+            .get()
+            .await;
+        assert!(!s.platform_enabled("epic"));
+        assert_eq!(s.update_schedule, Schedule::default());
 
         storage
             .put(SETTINGS_KEY, Bytes::from_static(b"not json"))
