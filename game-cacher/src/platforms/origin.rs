@@ -3,9 +3,14 @@ use super::{Platform, domains};
 /// EA app / Origin: passive caching only (no usable open download protocol).
 pub struct Origin;
 
+impl Origin {
+    /// Platform identifier (`Platform::id`), also the cache key namespace.
+    pub const ID: &'static str = "origin";
+}
+
 impl Platform for Origin {
     fn id(&self) -> &'static str {
-        "origin"
+        Self::ID
     }
     fn name(&self) -> &'static str {
         "EA app / Origin"

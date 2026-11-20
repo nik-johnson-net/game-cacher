@@ -1,85 +1,103 @@
 //! Compact in-memory form of LRU index entries. The index holds one entry per
-//! cached object (millions on a large cache), so keys are stored as an interned
-//! identifier plus the 32-byte object hash instead of the prefix string, and the
-//! slice bitset keeps its first word inline.
-use std::sync::{Arc, RwLock};
+//! cached object (millions on a large cache), so an object of a known platform
+//! is keyed by its platform number plus the 32-byte object hash instead of the
+//! prefix string, and the slice bitset keeps its first word inline.
+use std::hash::{Hash, Hasher};
 
-/// Interned identifier strings (one per platform; only grows).
-#[derive(Default)]
-pub(super) struct Ids(RwLock<Vec<Arc<str>>>);
-
-impl Ids {
-    pub fn get(&self, name: &str) -> Option<u32> {
-        let names = self.0.read().unwrap_or_else(|e| e.into_inner());
-        names.iter().position(|n| &**n == name).map(|i| i as u32)
-    }
-
-    pub fn intern(&self, name: &str) -> u32 {
-        if let Some(id) = self.get(name) {
-            return id;
-        }
-        let mut names = self.0.write().unwrap_or_else(|e| e.into_inner());
-        if let Some(i) = names.iter().position(|n| &**n == name) {
-            return i as u32;
-        }
-        names.push(name.into());
-        (names.len() - 1) as u32
-    }
-
-    /// All names, indexed by id.
-    pub fn names(&self) -> Vec<Arc<str>> {
-        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
-    }
-}
-
-/// Name of `id` in a `names()` table.
-pub(super) fn name(names: &[Arc<str>], id: u32) -> &str {
-    names.get(id as usize).map_or("", |n| n)
-}
+use crate::platforms::IDENTIFIERS;
 
 /// An object prefix as stored in the index.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone)]
 pub(super) enum Key {
-    /// `cache/<id>/<h0h1>/<h2h3>/<hex(hash)>`, the layout of `ObjectKey::prefix`.
-    Object { id: u32, hash: [u8; 32] },
-    /// Any other prefix, kept verbatim.
-    Other(Box<str>),
+    /// `cache/<IDENTIFIERS[platform]>/<h0h1>/<h2h3>/<hex(hash)>`, the layout of
+    /// `ObjectKey::prefix`; the identifier is the one in the prefix.
+    Object { platform: u8, hash: [u8; 32] },
+    /// Any other prefix (unknown identifier, odd layout), kept verbatim.
+    /// Identified by `prefix` alone; `identifier` is carried along for usage.
+    Other {
+        prefix: Box<str>,
+        identifier: Box<str>,
+    },
 }
 
 impl Key {
-    /// Parses a prefix. `id` resolves the identifier of a canonical prefix; None
-    /// from it means no such object can be indexed (the identifier is unknown).
-    pub fn parse(prefix: &str, id: impl FnOnce(&str) -> Option<u32>) -> Option<Key> {
+    /// Key for an object registered under `identifier` (used only when the
+    /// prefix isn't a canonical one of a known platform).
+    pub fn new(prefix: &str, identifier: &str) -> Key {
         match canonical(prefix) {
-            Some((name, hash)) => id(name).map(|id| Key::Object { id, hash }),
-            None => Some(Key::Other(prefix.into())),
+            Some((platform, hash)) => Key::Object { platform, hash },
+            None => Key::Other {
+                prefix: prefix.into(),
+                identifier: identifier.into(),
+            },
         }
     }
 
-    pub fn prefix(&self, names: &[Arc<str>]) -> String {
+    /// Key for looking up an existing object by prefix.
+    pub fn find(prefix: &str) -> Key {
+        Key::new(prefix, "")
+    }
+
+    pub fn identifier(&self) -> &str {
         match self {
-            Key::Object { id, hash } => {
+            Key::Object { platform, .. } => IDENTIFIERS[*platform as usize],
+            Key::Other { identifier, .. } => identifier,
+        }
+    }
+
+    pub fn prefix(&self) -> String {
+        match self {
+            Key::Object { platform, hash } => {
                 let h = hex::encode(hash);
-                format!("cache/{}/{}/{}/{h}", name(names, *id), &h[0..2], &h[2..4])
+                let id = IDENTIFIERS[*platform as usize];
+                format!("cache/{id}/{}/{}/{h}", &h[0..2], &h[2..4])
             }
-            Key::Other(p) => p.to_string(),
+            Key::Other { prefix, .. } => prefix.to_string(),
         }
     }
 }
 
-/// Splits a canonical prefix into (identifier, hash); None if it isn't one
-/// (so that formatting the parsed key gives back exactly the same string).
-fn canonical(prefix: &str) -> Option<(&str, [u8; 32])> {
+impl PartialEq for Key {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Key::Object { platform, hash },
+                Key::Object {
+                    platform: p,
+                    hash: h,
+                },
+            ) => platform == p && hash == h,
+            (Key::Other { prefix, .. }, Key::Other { prefix: p, .. }) => prefix == p,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Key {}
+
+impl Hash for Key {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Key::Object { platform, hash } => (0u8, platform, hash).hash(state),
+            Key::Other { prefix, .. } => (1u8, prefix).hash(state),
+        }
+    }
+}
+
+/// Splits a canonical prefix of a known platform into (platform, hash); None
+/// otherwise, so that formatting the key gives back exactly the same string.
+fn canonical(prefix: &str) -> Option<(u8, [u8; 32])> {
     let (id, rest) = prefix.strip_prefix("cache/")?.split_once('/')?;
     let (a, rest) = rest.split_once('/')?;
     let (b, h) = rest.split_once('/')?;
     let lower_hex = h.len() == 64 && h.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'));
-    if id.is_empty() || !lower_hex || a != &h[0..2] || b != &h[2..4] {
+    if !lower_hex || a != &h[0..2] || b != &h[2..4] {
         return None;
     }
+    let platform = IDENTIFIERS.iter().position(|i| *i == id)? as u8;
     let mut hash = [0u8; 32];
     hex::decode_to_slice(h, &mut hash).ok()?;
-    Some((id, hash))
+    Some((platform, hash))
 }
 
 /// Bitset of stored slice indices. Word 0 is inline: at the default 1 MiB slice
@@ -170,43 +188,34 @@ mod tests {
 
     #[test]
     fn canonical_prefixes_round_trip() {
-        let ids = Ids::default();
-        let p = ObjectKey::new("steam", "/depot/1/chunk/abc").prefix();
-        let k = Key::parse(&p, |n| Some(ids.intern(n))).unwrap();
-        assert!(matches!(k, Key::Object { .. }));
-        assert_eq!(k.prefix(&ids.names()), p);
-        // Same prefix, same key; unknown identifier on a read-only lookup → None.
-        assert_eq!(Key::parse(&p, |n| ids.get(n)), Some(k));
-        let epic = ObjectKey::new("epic", "/x").prefix();
-        assert_eq!(Key::parse(&epic, |n| ids.get(n)), None);
-    }
-
-    #[test]
-    fn other_prefixes_kept_verbatim() {
-        let ids = Ids::default();
-        let h = "ab".to_string() + &"0".repeat(62);
-        for p in [
-            "p1".to_string(),
-            "cache/x/aa/bb/c".to_string(),
-            format!("cache/s/ab/00/{}", h.to_uppercase()), // not lowercase
-            format!("cache/s/ac/00/{h}"),                  // wrong fan-out dir
-            format!("cache//ab/00/{h}"),                   // empty identifier
-        ] {
-            let k = Key::parse(&p, |n| Some(ids.intern(n))).unwrap();
-            assert_eq!(k, Key::Other(p.clone().into()), "{p}");
-            assert_eq!(k.prefix(&ids.names()), p);
+        for id in IDENTIFIERS {
+            let p = ObjectKey::new(id, "/depot/1/chunk/abc").prefix();
+            let k = Key::new(&p, id);
+            assert!(matches!(k, Key::Object { .. }), "{p}");
+            assert_eq!(k.prefix(), p);
+            assert_eq!(k.identifier(), *id);
+            assert_eq!(Key::find(&p), k);
         }
     }
 
     #[test]
-    fn interning() {
-        let ids = Ids::default();
-        assert_eq!(ids.get("steam"), None);
-        let s = ids.intern("steam");
-        assert_eq!(ids.intern("epic"), s + 1);
-        assert_eq!(ids.intern("steam"), s);
-        assert_eq!(name(&ids.names(), s + 1), "epic");
-        assert_eq!(name(&ids.names(), 99), "");
+    fn other_prefixes_kept_verbatim() {
+        let h = "ab".to_string() + &"0".repeat(62);
+        for p in [
+            "p1".to_string(),
+            "cache/x/aa/bb/c".to_string(),
+            format!("cache/unknown/ab/00/{h}"), // not a known platform
+            format!("cache/steam/ab/00/{}", h.to_uppercase()), // not lowercase
+            format!("cache/steam/ac/00/{h}"),   // wrong fan-out dir
+        ] {
+            let k = Key::new(&p, "someid");
+            assert!(matches!(k, Key::Other { .. }), "{p}");
+            assert_eq!(k.prefix(), p);
+            assert_eq!(k.identifier(), "someid");
+            // Looked up by prefix alone.
+            assert_eq!(Key::find(&p), k);
+        }
+        assert_ne!(Key::find("p1"), Key::find("p2"));
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 
-use self::compact::{Ids, Key, Slices, name};
+use self::compact::{Key, Slices};
 use super::key::object_prefix_of;
 use crate::metrics::Metrics;
 use crate::storage::DynStorage;
@@ -41,8 +41,6 @@ const MAX_TRACKED_SLICES: u64 = 1 << 24;
 
 #[derive(Debug, Clone, Default)]
 struct Entry {
-    /// Interned identifier (see `Ids`).
-    id: u32,
     /// Slice bytes + `meta_bytes`.
     bytes: u64,
     /// Size of the object's meta.json (replaced, not added, on rewrite).
@@ -73,13 +71,10 @@ struct Inner {
 }
 
 impl Inner {
-    fn touch(&mut self, key: Key, id: u32) -> &mut Entry {
+    fn touch(&mut self, key: Key) -> &mut Entry {
         self.seq += 1;
         let seq = self.seq;
-        let e = self.objects.entry(key).or_insert_with(|| Entry {
-            id,
-            ..Default::default()
-        });
+        let e = self.objects.entry(key).or_default();
         e.last_access = now_secs();
         e.seq = seq;
         e
@@ -102,7 +97,6 @@ pub struct LruIndex {
     storage: DynStorage,
     max_bytes: Option<u64>,
     metrics: Arc<Metrics>,
-    ids: Ids,
     inner: Mutex<Inner>,
     dirty: AtomicBool,
     on_remove: RwLock<Option<RemoveHook>>,
@@ -129,9 +123,8 @@ impl LruIndex {
         max_bytes: Option<u64>,
         metrics: Arc<Metrics>,
     ) -> Result<Arc<Self>> {
-        let ids = Ids::default();
         let loaded = match storage.get(INDEX_KEY).await.context("reading LRU index")? {
-            Some(bytes) => match snapshot::decode(&bytes, &ids) {
+            Some(bytes) => match snapshot::decode(&bytes) {
                 Ok(o) => Some(o),
                 Err(e) => {
                     log::warn!("corrupt {INDEX_KEY} ({e}), rebuilding from storage");
@@ -143,7 +136,7 @@ impl LruIndex {
         let rebuilt = loaded.is_none();
         let objects = match loaded {
             Some(o) => o,
-            None => rebuild(&storage, &ids).await?,
+            None => rebuild(&storage).await?,
         };
         // Loaded entries share seq 0: ties within a second evict in arbitrary order.
         let total = objects.values().map(|e| e.bytes).sum();
@@ -162,7 +155,6 @@ impl LruIndex {
             storage,
             max_bytes,
             metrics,
-            ids,
             inner: Mutex::new(inner),
             dirty: AtomicBool::new(rebuilt),
             on_remove: RwLock::new(None),
@@ -182,18 +174,6 @@ impl LruIndex {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Key of an object that may be indexed (None: it can't be).
-    fn key(&self, prefix: &str) -> Option<Key> {
-        Key::parse(prefix, |n| self.ids.get(n))
-    }
-
-    /// Key and identifier id for registering an object.
-    fn key_new(&self, prefix: &str, identifier: &str) -> (Key, u32) {
-        let key = Key::parse(prefix, |n| Some(self.ids.intern(n)))
-            .unwrap_or_else(|| Key::Other(prefix.into()));
-        (key, self.ids.intern(identifier))
-    }
-
     fn notify_removed(&self, prefixes: &[String]) {
         let hook = self
             .on_remove
@@ -207,16 +187,14 @@ impl LruIndex {
 
     /// Marks an object as used now.
     pub fn touch(&self, object_prefix: &str, identifier: &str) {
-        let (key, id) = self.key_new(object_prefix, identifier);
-        self.lock().touch(key, id);
+        self.lock().touch(Key::new(object_prefix, identifier));
         self.dirty.store(true, Ordering::Relaxed);
     }
 
     /// Records `bytes` newly stored for an object and touches it.
     pub fn record_write(&self, object_prefix: &str, identifier: &str, bytes: u64) {
-        let (key, id) = self.key_new(object_prefix, identifier);
         let mut inner = self.lock();
-        inner.touch(key, id).bytes += bytes;
+        inner.touch(Key::new(object_prefix, identifier)).bytes += bytes;
         inner.total += bytes;
         self.wrote(inner);
     }
@@ -233,9 +211,8 @@ impl LruIndex {
         if self.is_evicting(object_prefix) {
             return;
         }
-        let (key, id) = self.key_new(object_prefix, identifier);
         let mut inner = self.lock();
-        let e = inner.touch(key, id);
+        let e = inner.touch(Key::new(object_prefix, identifier));
         if e.set_slice(index) {
             e.bytes += bytes;
             inner.total += bytes;
@@ -245,9 +222,8 @@ impl LruIndex {
 
     /// Records the object's meta.json size, replacing any previous value.
     pub fn record_meta(&self, object_prefix: &str, identifier: &str, bytes: u64) {
-        let (key, id) = self.key_new(object_prefix, identifier);
         let mut inner = self.lock();
-        let e = inner.touch(key, id);
+        let e = inner.touch(Key::new(object_prefix, identifier));
         let old = std::mem::replace(&mut e.meta_bytes, bytes);
         e.bytes = e.bytes - old.min(e.bytes) + bytes;
         inner.total = inner.total - old.min(inner.total) + bytes;
@@ -268,19 +244,17 @@ impl LruIndex {
         if self.is_evicting(object_prefix) {
             return;
         }
-        let (key, id) = self.key_new(object_prefix, identifier);
-        self.lock().touch(key, id).set_slice(index);
+        self.lock()
+            .touch(Key::new(object_prefix, identifier))
+            .set_slice(index);
         self.dirty.store(true, Ordering::Relaxed);
     }
 
     /// Marks a slice as missing (a read found it absent or invalid). If it was
     /// known as stored, its `bytes` are no longer counted.
     pub fn unmark_slice(&self, object_prefix: &str, index: u64, bytes: u64) {
-        let Some(key) = self.key(object_prefix) else {
-            return;
-        };
         let mut inner = self.lock();
-        let Some(e) = inner.objects.get_mut(&key) else {
+        let Some(e) = inner.objects.get_mut(&Key::find(object_prefix)) else {
             return;
         };
         if e.slices.clear(index) {
@@ -293,12 +267,9 @@ impl LruIndex {
 
     /// True if every slice `0..count` is known to be stored.
     pub fn has_all_slices(&self, object_prefix: &str, count: u64) -> bool {
-        let Some(key) = self.key(object_prefix) else {
-            return false;
-        };
         self.lock()
             .objects
-            .get(&key)
+            .get(&Key::find(object_prefix))
             .is_some_and(|e| e.slices.count_below(count) == count)
     }
 
@@ -307,7 +278,7 @@ impl LruIndex {
     /// Entries touched after the listing started are left alone.
     pub async fn reconcile(&self) -> Result<()> {
         let started = now_secs();
-        let on_disk = rebuild(&self.storage, &self.ids).await?;
+        let on_disk = rebuild(&self.storage).await?;
         let (mut added, mut removed) = (0, Vec::new());
         {
             let mut inner = self.lock();
@@ -346,8 +317,7 @@ impl LruIndex {
                 removed.len()
             );
             self.dirty.store(true, Ordering::Relaxed);
-            let names = self.ids.names();
-            let removed: Vec<String> = removed.iter().map(|k| k.prefix(&names)).collect();
+            let removed: Vec<String> = removed.iter().map(Key::prefix).collect();
             self.notify_removed(&removed);
         }
         Ok(())
@@ -355,9 +325,7 @@ impl LruIndex {
 
     /// Forgets an object (after it was deleted from storage).
     pub fn remove_object(&self, object_prefix: &str) {
-        if let Some(key) = self.key(object_prefix)
-            && self.lock().remove(&key)
-        {
+        if self.lock().remove(&Key::find(object_prefix)) {
             self.dirty.store(true, Ordering::Relaxed);
         }
         self.notify_removed(&[object_prefix.to_string()]);
@@ -365,15 +333,12 @@ impl LruIndex {
 
     /// Forgets all objects of an identifier (after a platform purge).
     pub fn remove_identifier(&self, identifier: &str) {
-        let Some(id) = self.ids.get(identifier) else {
-            return;
-        };
         let removed: Vec<Key> = {
             let mut inner = self.lock();
             let keys: Vec<Key> = inner
                 .objects
                 .iter()
-                .filter(|(_, e)| e.id == id)
+                .filter(|(k, _)| k.identifier() == identifier)
                 .map(|(k, _)| k.clone())
                 .collect();
             keys.iter().for_each(|k| {
@@ -382,34 +347,25 @@ impl LruIndex {
             keys
         };
         self.dirty.store(true, Ordering::Relaxed);
-        let names = self.ids.names();
-        let removed: Vec<String> = removed.iter().map(|k| k.prefix(&names)).collect();
+        let removed: Vec<String> = removed.iter().map(Key::prefix).collect();
         self.notify_removed(&removed);
     }
 
     pub fn usage(&self) -> Usage {
-        let names = self.ids.names();
-        let mut per_id = vec![IdentifierUsage::default(); names.len()];
-        let (total_bytes, objects) = {
-            let inner = self.lock();
-            for e in inner.objects.values() {
-                if let Some(u) = per_id.get_mut(e.id as usize) {
-                    u.bytes += e.bytes;
-                    u.objects += 1;
-                }
-            }
-            (inner.total, inner.objects.len() as u64)
-        };
-        let per_identifier = per_id
-            .into_iter()
-            .enumerate()
-            .filter(|(_, u)| u.objects > 0)
-            .map(|(id, u)| (name(&names, id as u32).to_string(), u))
-            .collect();
+        let inner = self.lock();
+        let mut per_id: BTreeMap<&str, IdentifierUsage> = BTreeMap::new();
+        for (k, e) in &inner.objects {
+            let u = per_id.entry(k.identifier()).or_default();
+            u.bytes += e.bytes;
+            u.objects += 1;
+        }
         Usage {
-            total_bytes,
-            objects,
-            per_identifier,
+            total_bytes: inner.total,
+            objects: inner.objects.len() as u64,
+            per_identifier: per_id
+                .into_iter()
+                .map(|(id, u)| (id.to_string(), u))
+                .collect(),
         }
     }
 
@@ -420,7 +376,7 @@ impl LruIndex {
     /// Writes `index/lru.json`, serialized straight from the in-memory map.
     pub async fn snapshot(&self) -> Result<()> {
         self.dirty.store(false, Ordering::Relaxed);
-        let json = snapshot::encode(&self.lock().objects, &self.ids)?;
+        let json = snapshot::encode(&self.lock().objects)?;
         let res = self.storage.put(INDEX_KEY, Bytes::from(json)).await;
         if res.is_err() {
             self.dirty.store(true, Ordering::Relaxed);
@@ -430,7 +386,6 @@ impl LruIndex {
 
     /// Picks least-recently-used objects to drop so the total ends at or below 90% of max.
     fn pick_victims(&self, max: u64) -> Vec<(String, String)> {
-        let names = self.ids.names();
         let inner = self.lock();
         if inner.total <= max {
             return Vec::new();
@@ -445,7 +400,7 @@ impl LruIndex {
                 break;
             }
             total = total.saturating_sub(e.bytes);
-            victims.push((key.prefix(&names), name(&names, e.id).to_string()));
+            victims.push((key.prefix(), key.identifier().to_string()));
         }
         victims
     }
@@ -537,20 +492,19 @@ impl LruIndex {
 }
 
 /// Rebuilds the index by listing every key under `cache/`.
-async fn rebuild(storage: &DynStorage, ids: &Ids) -> Result<HashMap<Key, Entry>> {
+async fn rebuild(storage: &DynStorage) -> Result<HashMap<Key, Entry>> {
     let now = now_secs();
     let mut objects: HashMap<Key, Entry> = HashMap::new();
     for info in storage.list("cache/").await.context("listing cache/")? {
         let Some((id, prefix)) = object_prefix_of(&info.key) else {
             continue;
         };
-        let key = Key::parse(prefix, |n| Some(ids.intern(n)))
-            .unwrap_or_else(|| Key::Other(prefix.into()));
-        let e = objects.entry(key).or_insert_with(|| Entry {
-            id: ids.intern(id),
-            last_access: now,
-            ..Default::default()
-        });
+        let e = objects
+            .entry(Key::new(prefix, id))
+            .or_insert_with(|| Entry {
+                last_access: now,
+                ..Default::default()
+            });
         e.bytes += info.size;
         match info.key[prefix.len()..].trim_start_matches('/') {
             "meta.json" => e.meta_bytes += info.size,
@@ -654,13 +608,16 @@ mod tests {
             "stale snapshot before reconcile"
         );
         // Make the loaded entry look older than the reconcile start.
-        let ka = idx.key(&a).unwrap();
-        idx.lock().objects.get_mut(&ka).unwrap().last_access = 1;
+        idx.lock()
+            .objects
+            .get_mut(&Key::find(&a))
+            .unwrap()
+            .last_access = 1;
         idx.reconcile().await.unwrap();
         let u = idx.usage();
         assert_eq!((u.total_bytes, u.objects), (52, 1));
         assert!(u.per_identifier.contains_key("epic"));
-        assert!(idx.lock().objects.contains_key(&idx.key(&b).unwrap()));
+        assert!(idx.lock().objects.contains_key(&Key::find(&b)));
     }
 
     #[tokio::test]

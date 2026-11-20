@@ -17,7 +17,7 @@ use crate::platforms::{
 };
 
 const REFRESH_SECRET: &str = "epic.refresh_token";
-const IDENTIFIER: &str = "epic";
+const IDENTIFIER: &str = Epic::ID;
 const WARM_CONCURRENCY: usize = 8;
 /// Engine/tooling namespaces that appear in launcher assets but are not games.
 const NON_GAME_NAMESPACES: &[&str] = &["ue"];

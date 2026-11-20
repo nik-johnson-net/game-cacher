@@ -13,7 +13,7 @@ use crate::platforms::{
     UpdateReport, host_matches,
 };
 
-const IDENTIFIER: &str = "blizzard";
+const IDENTIFIER: &str = Blizzard::ID;
 const REGION: &str = "us";
 const FALLBACK_HOST: &str = "level3.blizzard.com";
 const WARM_CONCURRENCY: usize = 8;

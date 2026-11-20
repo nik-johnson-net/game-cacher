@@ -12,6 +12,9 @@ use super::{
 pub struct WindowsUpdate {}
 
 impl WindowsUpdate {
+    /// Platform identifier (`Platform::id`), also the cache key namespace.
+    pub const ID: &'static str = "windowsupdate";
+
     pub fn new() -> Self {
         Self {}
     }
@@ -25,7 +28,7 @@ impl Default for WindowsUpdate {
 
 impl Platform for WindowsUpdate {
     fn id(&self) -> &'static str {
-        "windowsupdate"
+        Self::ID
     }
     fn name(&self) -> &'static str {
         "Windows Update"

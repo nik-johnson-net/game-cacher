@@ -19,6 +19,9 @@ pub struct Epic {
 }
 
 impl Epic {
+    /// Platform identifier (`Platform::id`), also the cache key namespace.
+    pub const ID: &'static str = "epic";
+
     pub fn new() -> Self {
         Self::with_endpoints(Endpoints::default())
     }
@@ -41,7 +44,7 @@ impl Default for Epic {
 
 impl Platform for Epic {
     fn id(&self) -> &'static str {
-        "epic"
+        Self::ID
     }
     fn name(&self) -> &'static str {
         "Epic Games"
