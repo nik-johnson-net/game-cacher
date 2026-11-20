@@ -110,6 +110,7 @@ pub async fn start(config: Config, env: EnvSecrets, o: Overrides) -> Result<Runn
         index: index.clone(),
         metrics: metrics.clone(),
         slice_size: config.slice_size,
+        read_ahead: config.read_ahead,
     });
     let updates = UpdateManager::new(
         platforms.clone(),

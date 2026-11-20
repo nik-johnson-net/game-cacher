@@ -82,6 +82,9 @@ pub struct Config {
     pub cache_max_size: Option<u64>,
     #[arg(long, env = "GC_SLICE_SIZE", value_parser = parse_size, default_value = "1MiB")]
     pub slice_size: u64,
+    /// Slices fetched in parallel per client download (1 = one at a time).
+    #[arg(long, env = "GC_READ_AHEAD", default_value_t = 4)]
+    pub read_ahead: usize,
 
     #[arg(long, env = "GC_UI_PATH", default_value = "/opt/game-cacher/ui")]
     pub ui_path: PathBuf,
@@ -164,6 +167,9 @@ impl Config {
         }
         if self.slice_size < 64 * 1024 || self.slice_size > 64 * 1024 * 1024 {
             anyhow::bail!("--slice-size must be between 64KiB and 64MiB");
+        }
+        if !(1..=32).contains(&self.read_ahead) {
+            anyhow::bail!("--read-ahead must be between 1 and 32");
         }
         Ok(())
     }
@@ -259,5 +265,10 @@ mod tests {
         c.secrets = SecretsKind::Vault;
         c.vault_addr = Some("http://vault:8200".into());
         assert!(c.validate(&env).is_err(), "vault without token");
+        for (n, ok) in [(0, false), (1, true), (32, true), (33, false)] {
+            let mut c = base();
+            c.read_ahead = n;
+            assert_eq!(c.validate(&env).is_ok(), ok, "read_ahead {n}");
+        }
     }
 }

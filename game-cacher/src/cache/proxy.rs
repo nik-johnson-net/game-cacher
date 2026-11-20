@@ -391,10 +391,14 @@ fn slice_stream(
     let (first_idx, last_idx) = (a / meta.slice_size, b / meta.slice_size);
     let head = stream::once(futures::future::ready(Ok((first_idx, first.0, first.1))));
     let (e2, t2, m2) = (engine.clone(), t.clone(), meta.clone());
-    let rest = stream::iter(first_idx + 1..=last_idx).then(move |i| {
-        let (e, t, m) = (e2.clone(), t2.clone(), m2.clone());
-        async move { e.slice(&t, &m, i).await.map(|(d, c)| (i, d, c)) }
-    });
+    // Keep up to `read_ahead` slices in flight so a miss isn't one upstream
+    // round trip per slice; `buffered` still yields them in order.
+    let rest = stream::iter(first_idx + 1..=last_idx)
+        .map(move |i| {
+            let (e, t, m) = (e2.clone(), t2.clone(), m2.clone());
+            async move { e.slice(&t, &m, i).await.map(|(d, c)| (i, d, c)) }
+        })
+        .buffered(engine.read_ahead());
     head.chain(rest).map(move |r| {
         let r = r.map(|(i, data, cached)| (trim(&meta, i, data, a, b), cached));
         emit(&engine, t.identifier(), r)

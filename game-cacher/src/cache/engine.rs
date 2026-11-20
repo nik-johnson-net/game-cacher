@@ -38,6 +38,7 @@ pub struct CacheEngine {
     pub(crate) index: Arc<LruIndex>,
     pub(crate) metrics: Arc<Metrics>,
     slice_size: u64,
+    read_ahead: usize,
     metas: DashMap<String, Arc<Meta>>,
     probes: DashMap<String, Arc<OnceCell<ProbeShared>>>,
     slices: DashMap<String, Arc<OnceCell<Result<Bytes, CacheError>>>>,
@@ -51,6 +52,8 @@ pub struct EngineDeps {
     pub index: Arc<LruIndex>,
     pub metrics: Arc<Metrics>,
     pub slice_size: u64,
+    /// Slices fetched in parallel per client download (min 1).
+    pub read_ahead: usize,
 }
 
 /// Failure while serving a cached object. Cloneable so coalesced waiters share it.
@@ -265,6 +268,7 @@ impl CacheEngine {
             index: deps.index,
             metrics: deps.metrics,
             slice_size: deps.slice_size.max(1),
+            read_ahead: deps.read_ahead.max(1),
             metas: DashMap::new(),
             probes: DashMap::new(),
             slices: DashMap::new(),
@@ -277,6 +281,11 @@ impl CacheEngine {
             }
         }));
         engine
+    }
+
+    /// Slices to keep in flight when streaming an object.
+    pub(crate) fn read_ahead(&self) -> usize {
+        self.read_ahead
     }
 
     /// Router for the cache HTTP listener: every request is proxied by Host header.
@@ -625,12 +634,21 @@ impl CacheEngine {
             }
             return Ok(out.freeze());
         }
-        for i in first..=last {
-            let data = match (&fresh, i) {
-                (Some(f), 0) => f.clone(),
-                _ => self.slice(t, &meta, i).await?.0,
-            };
-            out.extend_from_slice(&trim(&meta, i, data, a, b));
+        let meta = &meta;
+        let mut slices = futures::stream::iter(first..=last)
+            .map(|i| {
+                let fresh = fresh.clone();
+                async move {
+                    let data = match (fresh, i) {
+                        (Some(f), 0) => f,
+                        _ => self.slice(t, meta, i).await?.0,
+                    };
+                    Ok::<_, CacheError>(trim(meta, i, data, a, b))
+                }
+            })
+            .buffered(self.read_ahead);
+        while let Some(part) = slices.next().await {
+            out.extend_from_slice(&part?);
         }
         Ok(out.freeze())
     }

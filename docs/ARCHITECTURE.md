@@ -74,6 +74,7 @@ docker/Dockerfile          multi-stage UBI10 image
 | Vault auth | `VAULT_TOKEN`, or `VAULT_ROLE_ID`+`VAULT_SECRET_ID` (AppRole) | env only |
 | `--cache-max-size` (e.g. `2TB`, `500GiB`) | `GC_CACHE_MAX_SIZE` | unset → unbounded |
 | `--slice-size` | `GC_SLICE_SIZE` | `1MiB` |
+| `--read-ahead` (slices in flight per download, 1–32) | `GC_READ_AHEAD` | `4` |
 | `--ui-path` | `GC_UI_PATH` | `/opt/game-cacher/ui` |
 | admin password | `GC_ADMIN_PASSWORD` | env only; required unless `--disable-auth` |
 | `--disable-auth` | `GC_DISABLE_AUTH` | false |
@@ -142,6 +143,10 @@ Unknown/missing platforms default to enabled; missing `managed` entries default 
    `Content-Range`. If upstream ignores Range (returns 200 to a ranged request), the
    body is streamed through and split into slices as it arrives.
 5. **Coalescing**: concurrent misses on the same slice share one upstream fetch.
+   **Read-ahead**: a download keeps up to `read_ahead` slices in flight (upstream
+   fetches or storage reads), yielded in order, so a miss costs one round trip per
+   `read_ahead` slices rather than per slice. Applies to proxied responses and
+   in-process `Prefill::get`/`get_range`.
 6. **Redirects** (301/302/307/308) from upstream are followed server-side and
    never cached; the final body is stored under the original key.
 7. **Loop detection**: requests carrying `X-GameCacher-Processed-By: <instance-id>`
