@@ -73,6 +73,7 @@ list; `docs/ARCHITECTURE.md` has the table. The most common ones:
 | `GC_SECRETS` | `storage` | `storage` (needs `GC_SECRETS_KEY`) or `vault` (`GC_VAULT_ADDR`, `GC_VAULT_MOUNT`, `GC_VAULT_PATH`, `VAULT_TOKEN` or `VAULT_ROLE_ID`+`VAULT_SECRET_ID`) |
 | `GC_CACHE_MAX_SIZE` | unbounded | e.g. `2TB`, `500GiB` |
 | `GC_SLICE_SIZE` | `1MiB` | Cache slice size for new objects |
+| `GC_READ_AHEAD` | `4` | Slices fetched in parallel per download (1–32); higher helps on high-latency upstreams |
 | `GC_ADMIN_PASSWORD` | — (required) | Web UI / API password (or `GC_DISABLE_AUTH=true`) |
 | `GC_DISABLE_DNS` / `GC_DISABLE_SNI` | false | Turn off DNS or SNI if you run your own |
 | `GC_ALLOW_PRIVATE_UPSTREAM` | false | Allow upstream hosts that resolve to private/loopback addresses (e.g. a local mirror). Off by default so the cache can't be used to reach into your LAN |

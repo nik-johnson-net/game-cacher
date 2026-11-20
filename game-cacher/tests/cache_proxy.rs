@@ -40,6 +40,8 @@ struct FakeCdn {
     counts: Arc<Mutex<HashMap<String, usize>>>,
     user_agents: Arc<Mutex<HashMap<String, String>>>,
     mutable_size: Arc<AtomicU64>,
+    in_flight: Arc<AtomicU64>,
+    max_in_flight: Arc<AtomicU64>,
 }
 
 fn serve_bytes(size: u64, range: Option<&str>, etag: bool) -> Response {
@@ -93,6 +95,14 @@ async fn upstream_handler(State(s): State<FakeCdn>, req: Request) -> Response {
         ["obj", n] => serve_bytes(n.parse().unwrap(), range, false),
         ["etag", n] => serve_bytes(n.parse().unwrap(), range, true),
         ["norange", n] => serve_bytes(n.parse().unwrap(), None, false),
+        // Slow responses, tracking the peak number of concurrent requests.
+        ["slow", n] => {
+            let now = s.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            s.max_in_flight.fetch_max(now, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            s.in_flight.fetch_sub(1, Ordering::SeqCst);
+            serve_bytes(n.parse().unwrap(), range, false)
+        }
         ["mutable"] => serve_bytes(s.mutable_size.load(Ordering::SeqCst), range, false),
         ["redirect"] => (StatusCode::FOUND, [(LOCATION, "/obj/300000")]).into_response(),
         ["missing"] => (StatusCode::NOT_FOUND, "nope").into_response(),
@@ -153,6 +163,8 @@ struct H {
     storage: DynStorage,
     index: Arc<LruIndex>,
     settings: Arc<SettingsStore>,
+    /// Holds the dead upstream's port so no other listener can take it.
+    _reserved: Option<tokio::net::TcpSocket>,
 }
 
 #[derive(Default)]
@@ -160,6 +172,7 @@ struct Opts {
     max_bytes: Option<u64>,
     resolver: Option<Arc<dyn HostResolver>>,
     dead_upstream: bool,
+    read_ahead: Option<usize>,
 }
 
 async fn harness() -> H {
@@ -174,10 +187,14 @@ async fn harness_with(opts: Opts) -> H {
             .with_state(up.clone()),
     )
     .await;
+    // Bound but never listening: connections are refused, and the port can't
+    // be reused (e.g. by the cache listener, which would turn 502 into 508).
+    let mut reserved = None;
     if opts.dead_upstream {
-        let l = std::net::TcpListener::bind((LOCALHOST, 0)).unwrap();
-        up_port = l.local_addr().unwrap().port();
-        drop(l);
+        let sock = tokio::net::TcpSocket::new_v4().unwrap();
+        sock.bind((LOCALHOST, 0).into()).unwrap();
+        up_port = sock.local_addr().unwrap().port();
+        reserved = Some(sock);
     }
     let storage: DynStorage = Arc::new(MemoryStorage::new());
     let metrics = Metrics::new();
@@ -196,6 +213,7 @@ async fn harness_with(opts: Opts) -> H {
         index: index.clone(),
         metrics,
         slice_size: SLICE,
+        read_ahead: opts.read_ahead.unwrap_or(4),
     });
     let port = spawn(engine.router()).await;
     H {
@@ -210,6 +228,7 @@ async fn harness_with(opts: Opts) -> H {
         storage,
         index,
         settings,
+        _reserved: reserved,
     }
 }
 
@@ -659,6 +678,41 @@ async fn concurrent_requests_coalesce() {
         assert_eq!(body, data(300000));
     }
     assert_eq!(h.count("/obj/300000"), 5); // ceil(300000 / 65536)
+}
+
+#[tokio::test]
+async fn read_ahead_fetches_slices_in_parallel() {
+    for (read_ahead, expected_peak) in [(4, 4), (1, 1)] {
+        let h = harness_with(Opts {
+            read_ahead: Some(read_ahead),
+            ..Default::default()
+        })
+        .await;
+        let size = 10 * SLICE + 123;
+        let path = format!("/slow/{size}");
+        let (status, cache, body) = h.fetch(EPIC, &path, None).await;
+        assert_eq!((status, cache.as_str()), (StatusCode::OK, "MISS"));
+        assert_eq!(body, data(size), "read_ahead {read_ahead}: bytes in order");
+        assert_eq!(h.count(&path), 11, "each slice fetched once");
+        let peak = h.up.max_in_flight.load(Ordering::SeqCst);
+        assert_eq!(
+            peak, expected_peak,
+            "read_ahead {read_ahead}: peak in flight"
+        );
+
+        // In-process reads (prefill get_range) on a miss use the same read-ahead.
+        h.up.max_in_flight.store(0, Ordering::SeqCst);
+        let size = 10 * SLICE + 456;
+        let path = format!("/slow/{size}");
+        let range = h
+            .engine
+            .get_range("epic", EPIC, &path, 100, size - 100)
+            .await
+            .unwrap();
+        assert_eq!(range, data(size)[100..=(size - 100) as usize]);
+        let peak = h.up.max_in_flight.load(Ordering::SeqCst);
+        assert_eq!(peak, expected_peak, "get_range read_ahead {read_ahead}");
+    }
 }
 
 #[tokio::test]
