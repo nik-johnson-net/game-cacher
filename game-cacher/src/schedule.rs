@@ -7,10 +7,13 @@
 use std::fmt;
 use std::str::FromStr;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Duration, LocalResult, NaiveDateTime, NaiveTime, Offset, TimeZone, Utc};
 use chrono_tz::Tz;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+/// Minimum spacing between two times, including across midnight.
+pub const MIN_GAP_MINUTES: i64 = 5;
 
 /// A local time of day with minute precision, serialised as `"HH:MM"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -21,9 +24,18 @@ impl FromStr for TimeOfDay {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self> {
+        let invalid = || format!("invalid time {s:?}, expected HH:MM");
+        // chrono alone would also accept "3:00" and " 3:00".
+        let b = s.as_bytes();
+        let digits = [0, 1, 3, 4]
+            .iter()
+            .all(|&i| b.get(i).is_some_and(u8::is_ascii_digit));
+        if b.len() != 5 || b[2] != b':' || !digits {
+            bail!(invalid());
+        }
         NaiveTime::parse_from_str(s, "%H:%M")
             .map(Self)
-            .with_context(|| format!("invalid time {s:?}, expected HH:MM"))
+            .with_context(invalid)
     }
 }
 
@@ -51,7 +63,8 @@ impl From<TimeOfDay> for String {
 #[serde(default)]
 pub struct Schedule {
     pub timezone: Tz,
-    /// Sorted, without duplicates. Empty means manual runs only.
+    /// Sorted, without duplicates (also when read from disk). Empty means manual runs only.
+    #[serde(deserialize_with = "normalized_times")]
     pub times: Vec<TimeOfDay>,
     /// When the timezone or times last changed; earlier triggers are never caught up.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -69,7 +82,8 @@ impl Default for Schedule {
 }
 
 impl Schedule {
-    /// Validates an IANA timezone name and `HH:MM` times; times are sorted and de-duplicated.
+    /// Validates an IANA timezone name and `HH:MM` times at least `MIN_GAP_MINUTES`
+    /// apart; times are sorted and de-duplicated.
     pub fn parse(timezone: &str, times: &[impl AsRef<str>]) -> Result<Self> {
         let timezone = timezone
             .parse::<Tz>()
@@ -78,8 +92,8 @@ impl Schedule {
             .iter()
             .map(|t| t.as_ref().parse())
             .collect::<Result<Vec<TimeOfDay>>>()?;
-        times.sort();
-        times.dedup();
+        normalize(&mut times);
+        check_spacing(&times)?;
         Ok(Self {
             timezone,
             times,
@@ -143,6 +157,33 @@ impl Schedule {
     }
 }
 
+fn normalize(times: &mut Vec<TimeOfDay>) {
+    times.sort();
+    times.dedup();
+}
+
+fn normalized_times<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<TimeOfDay>, D::Error> {
+    let mut times = Vec::<TimeOfDay>::deserialize(d)?;
+    normalize(&mut times);
+    Ok(times)
+}
+
+/// Errors if two neighbouring sorted times (or the last and first, across
+/// midnight) are closer than `MIN_GAP_MINUTES`.
+fn check_spacing(times: &[TimeOfDay]) -> Result<()> {
+    let (Some(&first), Some(&last)) = (times.first(), times.last()) else {
+        return Ok(());
+    };
+    let pairs = times.windows(2).map(|w| (w[0], w[1]));
+    for (a, b) in pairs.chain((times.len() > 1).then_some((last, first))) {
+        let gap = (b.0 - a.0).num_minutes().rem_euclid(24 * 60);
+        if gap < MIN_GAP_MINUTES {
+            bail!("times must be at least {MIN_GAP_MINUTES} minutes apart ({a} and {b})");
+        }
+    }
+    Ok(())
+}
+
 /// Maps a wall-clock time to an instant. In a DST overlap the earlier instant
 /// wins; in a DST gap the time is shifted forward by the gap's length.
 fn resolve(tz: Tz, local: NaiveDateTime) -> DateTime<Utc> {
@@ -172,7 +213,9 @@ mod tests {
     #[test]
     fn time_of_day_parsing() {
         assert_eq!("16:30".parse::<TimeOfDay>().unwrap().to_string(), "16:30");
-        for bad in ["24:00", "12:60", "2pm", "02:00:00", "", "0200"] {
+        for bad in [
+            "24:00", "12:60", "2pm", "02:00:00", "", "0200", "3:00", " 3:00", "03:0", "+3:00",
+        ] {
             assert!(bad.parse::<TimeOfDay>().is_err(), "{bad:?} should fail");
         }
         let t: TimeOfDay = serde_json::from_str(r#""03:05""#).unwrap();
@@ -190,6 +233,12 @@ mod tests {
         assert_eq!(sched("Asia/Calcutta", &[]).timezone.name(), "Asia/Calcutta");
         assert!(Schedule::parse("Mars/Olympus", &["02:00"]).is_err());
         assert!(Schedule::parse("UTC", &["2am"]).is_err());
+        assert!(Schedule::parse("UTC", &["02:00", "02:05", "23:59"]).is_ok());
+        let close = Schedule::parse("UTC", &["02:00", "02:04"]).unwrap_err();
+        assert!(close.to_string().contains("02:00 and 02:04"), "{close}");
+        // Spacing wraps around midnight.
+        assert!(Schedule::parse("UTC", &["23:58", "00:02"]).is_err());
+        assert!(Schedule::parse("UTC", &["23:57", "00:02"]).is_ok());
         assert!(
             Schedule::parse("UTC", &[] as &[&str])
                 .unwrap()
@@ -209,6 +258,13 @@ mod tests {
         assert_eq!(s.timezone, Tz::Asia__Tokyo);
         assert_eq!(s.times, Schedule::default().times);
         assert!(serde_json::from_str::<Schedule>(r#"{"timezone":"Nowhere"}"#).is_err());
+        // Times read from disk are normalized too, so a reordered save is not a change.
+        let mut s: Schedule =
+            serde_json::from_str(r#"{"timezone":"UTC","times":["16:00","02:00","16:00"]}"#)
+                .unwrap();
+        assert_eq!(s, sched("UTC", &["02:00", "16:00"]));
+        s.set(sched("UTC", &["16:00", "02:00"]), Utc::now());
+        assert_eq!(s.changed, None);
     }
 
     #[test]

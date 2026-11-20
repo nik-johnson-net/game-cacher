@@ -119,8 +119,11 @@ lancache, so CDN tokens don't fragment the cache). `identifier` = platform id
 ```
 Unknown/missing platforms default to enabled; missing `managed` entries default to empty.
 `update_schedule` defaults to `{"timezone": "UTC", "times": ["03:00"]}`; `times` are
-sorted, unique `HH:MM` and empty means manual runs only. `changed` is set by the
-server when the timezone or times change. The retired `update_interval_minutes` is ignored.
+sorted, unique `HH:MM` (normalized again on load) and empty means manual runs only.
+`changed` is set by the server when the timezone or times change. An unreadable
+`update_schedule` (e.g. a timezone unknown to this build) logs a warning and falls
+back to the default rather than failing startup. The retired `update_interval_minutes`
+is ignored with a startup warning (dropped on the next save).
 
 ## Cache engine semantics (modelled on lancache/monolithic)
 
@@ -239,7 +242,7 @@ Errors: `{"error": "message"}` with appropriate status.
 | PUT | `/api/platforms/{id}/managed/selection` | `{"selected":[game_id]}` → `ManagedStatus` (400 if the platform rejects an entry, e.g. a non-WU URL) |
 | POST | `/api/platforms/{id}/managed/run` | start update run now → 202 `{"started": true}` (409 if running or the platform is disabled) |
 | GET | `/api/settings` | `{"update_schedule":{"timezone","times":["HH:MM"]}}` |
-| PUT | `/api/settings` | same → same, normalized (400 on an unknown IANA timezone or a malformed time) |
+| PUT | `/api/settings` | same → same, normalized (400 on an unknown IANA timezone, a time not exactly `HH:MM`, or times less than 5 minutes apart, also across midnight) |
 
 ```
 PlatformSummary = { id, name, description, enabled, domains: [str], managed: bool,

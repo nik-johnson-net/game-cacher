@@ -7,7 +7,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::RwLock;
 
 use crate::platforms::StateStore;
@@ -34,7 +34,7 @@ pub struct Settings {
     pub platforms: BTreeMap<String, PlatformSettings>,
     #[serde(default)]
     pub managed: BTreeMap<String, ManagedSettings>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_schedule")]
     pub update_schedule: Schedule,
 }
 
@@ -56,6 +56,28 @@ fn default_true() -> bool {
     true
 }
 
+/// A schedule this build can't read (a hand edit, or a timezone from a newer
+/// tz database) falls back to the default instead of failing startup.
+fn lenient_schedule<'de, D: Deserializer<'de>>(d: D) -> Result<Schedule, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(value).unwrap_or_else(|e| {
+        log::warn!("settings.json: unreadable update_schedule ({e}), using the default");
+        Schedule::default()
+    }))
+}
+
+fn parse_settings(bytes: &[u8]) -> Result<Settings> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).context("parsing settings.json")?;
+    if value.get("update_interval_minutes").is_some() {
+        log::warn!(
+            "settings.json: update_interval_minutes is no longer used; managed updates follow \
+             update_schedule (default 03:00 UTC), set the times on the Settings page"
+        );
+    }
+    serde_json::from_value(value).context("parsing settings.json")
+}
+
 /// Cached settings document with write-through persistence.
 pub struct SettingsStore {
     storage: DynStorage,
@@ -65,7 +87,7 @@ pub struct SettingsStore {
 impl SettingsStore {
     pub async fn load(storage: DynStorage) -> Result<Self> {
         let current = match storage.get(SETTINGS_KEY).await? {
-            Some(bytes) => serde_json::from_slice(&bytes).context("parsing settings.json")?,
+            Some(bytes) => parse_settings(&bytes)?,
             None => Settings::default(),
         };
         Ok(Self {
@@ -179,6 +201,24 @@ mod tests {
             .await;
         assert!(s.platform_enabled("epic"));
         // The retired interval setting is ignored in favour of the default schedule.
+        assert_eq!(s.update_schedule, Schedule::default());
+
+        // An unreadable schedule falls back to the default; the rest still loads.
+        storage
+            .put(
+                SETTINGS_KEY,
+                Bytes::from_static(
+                    br#"{"platforms":{"epic":{"enabled":false}},"update_schedule":{"timezone":"Mars/Olympus","times":["03:00"]}}"#,
+                ),
+            )
+            .await
+            .unwrap();
+        let s = SettingsStore::load(storage.clone())
+            .await
+            .unwrap()
+            .get()
+            .await;
+        assert!(!s.platform_enabled("epic"));
         assert_eq!(s.update_schedule, Schedule::default());
 
         storage

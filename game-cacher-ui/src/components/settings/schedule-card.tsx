@@ -8,14 +8,9 @@ import { Card, CardBody, CardHeader } from "@/components/ui/card";
 import { Field, FieldError, Input, Label, Select } from "@/components/ui/form";
 import { Spinner } from "@/components/ui/loading";
 import { useToast } from "@/context/toast";
+import { MIN_GAP_MINUTES, TIME_RE, normalizeTimes, tooClose } from "@/lib/schedule";
 
-const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 const BROWSER_TZ = Intl.DateTimeFormat().resolvedOptions().timeZone;
-
-/** Sorted, de-duplicated — the form the server stores. */
-function normalize(times: string[]): string[] {
-  return [...new Set(times)].sort();
-}
 
 /** One hour after the latest time, wrapping at midnight, skipping times already listed. */
 function suggestTime(times: string[]): string {
@@ -31,7 +26,8 @@ function suggestTime(times: string[]): string {
 function validate(times: string[]): string | null {
   if (times.some((t) => !TIME_RE.test(t))) return "Enter every time as HH:MM.";
   if (new Set(times).size !== times.length) return "Each time can only be listed once.";
-  return null;
+  const close = tooClose(normalizeTimes(times));
+  return close && `${close.join(" and ")} are less than ${MIN_GAP_MINUTES} minutes apart.`;
 }
 
 export function ScheduleCard({ initial, onSaved }: { initial: UpdateSchedule; onSaved: (s: Settings) => void }) {
@@ -41,17 +37,14 @@ export function ScheduleCard({ initial, onSaved }: { initial: UpdateSchedule; on
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  const zones = useMemo(() => {
+  const zones = useMemo(
     // Browsers may report a legacy alias (e.g. Asia/Calcutta) missing from the list; the server accepts aliases.
-    return [...new Set(["UTC", ...Intl.supportedValuesOf("timeZone"), initial.timezone, BROWSER_TZ])];
-  }, [initial.timezone]);
+    () => [...new Set(["UTC", ...Intl.supportedValuesOf("timeZone"), initial.timezone, BROWSER_TZ])],
+    [initial.timezone],
+  );
 
   const invalid = validate(times);
-  const dirty = timezone !== initial.timezone || normalize(times).join() !== initial.times.join();
-
-  const setTime = (i: number, value: string) => setTimes((ts) => ts.map((t, j) => (j === i ? value : t)));
-  const removeTime = (i: number) => setTimes((ts) => ts.filter((_, j) => j !== i));
-  const addTime = () => setTimes((ts) => [...ts, suggestTime(ts)]);
+  const dirty = timezone !== initial.timezone || normalizeTimes(times).join() !== initial.times.join();
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
@@ -59,7 +52,7 @@ export function ScheduleCard({ initial, onSaved }: { initial: UpdateSchedule; on
     setBusy(true);
     setErr(null);
     try {
-      const saved = await putSettings({ update_schedule: { timezone, times: normalize(times) } });
+      const saved = await putSettings({ update_schedule: { timezone, times: normalizeTimes(times) } });
       onSaved(saved);
       const { times: st, timezone: tz } = saved.update_schedule;
       toast.push({
@@ -79,37 +72,7 @@ export function ScheduleCard({ initial, onSaved }: { initial: UpdateSchedule; on
       <form onSubmit={submit}>
         <CardBody className="space-y-4">
           <AlertBanner variant="error" message={err} />
-          <div>
-            <Label>Run at</Label>
-            {times.length === 0 ? (
-              <p className="text-sm text-text-secondary py-1">No times set — updates only run when you click Run now.</p>
-            ) : (
-              <ul className="flex flex-wrap gap-2">
-                {times.map((t, i) => (
-                  <li key={i} className="flex items-center gap-1">
-                    <Input
-                      type="time"
-                      step={60}
-                      required
-                      value={t}
-                      onChange={(e) => setTime(i, e.target.value)}
-                      aria-label={`Update time ${i + 1}`}
-                      aria-invalid={!TIME_RE.test(t) || times.indexOf(t) !== i || undefined}
-                      className="w-28 tabular-nums"
-                    />
-                    <Button variant="ghost-danger" size="icon-sm" onClick={() => removeTime(i)} aria-label={`Remove ${t || "time"}`}>
-                      <X />
-                    </Button>
-                  </li>
-                ))}
-              </ul>
-            )}
-            <FieldError error={invalid} />
-            <Button variant="secondary" size="sm" className="mt-2" onClick={addTime}>
-              <Plus />
-              Add time
-            </Button>
-          </div>
+          <TimesEditor times={times} onChange={setTimes} error={invalid} />
           <Field
             label="Timezone"
             htmlFor="timezone"
@@ -141,5 +104,48 @@ export function ScheduleCard({ initial, onSaved }: { initial: UpdateSchedule; on
         </CardBody>
       </form>
     </Card>
+  );
+}
+
+function TimesEditor({ times, onChange, error }: { times: string[]; onChange: (times: string[]) => void; error: string | null }) {
+  const setTime = (i: number, value: string) => onChange(times.map((t, j) => (j === i ? value : t)));
+
+  return (
+    <div>
+      <Label>Run at</Label>
+      {times.length === 0 ? (
+        <p className="text-sm text-text-secondary py-1">No times set — updates only run when you click Run now.</p>
+      ) : (
+        <ul className="flex flex-wrap gap-2">
+          {times.map((t, i) => (
+            <li key={i} className="flex items-center gap-1">
+              <Input
+                type="time"
+                step={60}
+                required
+                value={t}
+                onChange={(e) => setTime(i, e.target.value)}
+                aria-label={`Update time ${i + 1}`}
+                aria-invalid={!TIME_RE.test(t) || times.indexOf(t) !== i || undefined}
+                className="w-28 tabular-nums"
+              />
+              <Button
+                variant="ghost-danger"
+                size="icon-sm"
+                onClick={() => onChange(times.filter((_, j) => j !== i))}
+                aria-label={`Remove ${t || "time"}`}
+              >
+                <X />
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <FieldError error={error} />
+      <Button variant="secondary" size="sm" className="mt-2" onClick={() => onChange([...times, suggestTime(times)])}>
+        <Plus />
+        Add time
+      </Button>
+    </div>
   );
 }

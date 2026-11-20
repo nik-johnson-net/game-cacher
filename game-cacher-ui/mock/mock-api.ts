@@ -19,6 +19,7 @@ import type {
   UpdateRun,
   UpdateSchedule,
 } from "../src/api/types";
+import { MIN_GAP_MINUTES, TIME_RE, normalizeTimes, tooClose } from "../src/lib/schedule";
 
 const GB = 1e9;
 const MB = 1e6;
@@ -205,20 +206,26 @@ function summary(p: Platform): PlatformSummary {
   return rest;
 }
 
-/** Validates a PUT /api/settings body like the server: known timezone, HH:MM times, sorted and unique. */
+/** Validates a PUT /api/settings body like the server: known timezone, HH:MM times 5+ minutes apart, sorted and unique. */
 function parseSchedule(body: unknown): UpdateSchedule {
   const sched = isRecord(body) ? body.update_schedule : undefined;
   if (!isRecord(sched) || typeof sched.timezone !== "string" || !Array.isArray(sched.times)) {
     throw new HttpError(400, "update_schedule must have a timezone and times");
   }
   const { timezone, times } = sched;
-  if (timezone !== "UTC" && !Intl.supportedValuesOf("timeZone").includes(timezone)) {
+  try {
+    // Accepts legacy aliases (Asia/Calcutta) like the server, unlike Intl.supportedValuesOf.
+    new Intl.DateTimeFormat("en", { timeZone: timezone });
+  } catch {
     throw new HttpError(400, `unknown timezone "${timezone}"`);
   }
   for (const t of times) {
-    if (typeof t !== "string" || !/^([01]\d|2[0-3]):[0-5]\d$/.test(t)) throw new HttpError(400, `invalid time ${JSON.stringify(t)}, expected HH:MM`);
+    if (typeof t !== "string" || !TIME_RE.test(t)) throw new HttpError(400, `invalid time ${JSON.stringify(t)}, expected HH:MM`);
   }
-  return { timezone, times: [...new Set(times as string[])].sort() };
+  const normalized = normalizeTimes(times as string[]);
+  const close = tooClose(normalized);
+  if (close) throw new HttpError(400, `times must be at least ${MIN_GAP_MINUTES} minutes apart (${close.join(" and ")})`);
+  return { timezone, times: normalized };
 }
 
 /** Next scheduled run. Approximation: the mock reads the times as UTC whatever the timezone. */

@@ -659,6 +659,8 @@ async fn settings_and_ui_fallback() {
     for bad in [
         json!({"update_schedule": {"timezone": "Mars/Olympus", "times": ["02:00"]}}),
         json!({"update_schedule": {"timezone": "UTC", "times": ["25:00"]}}),
+        json!({"update_schedule": {"timezone": "UTC", "times": ["3:00"]}}),
+        json!({"update_schedule": {"timezone": "UTC", "times": ["02:00", "02:04"]}}),
     ] {
         let (s, v) = h.send(Method::PUT, "/api/settings", bad).await;
         assert_eq!(s, StatusCode::BAD_REQUEST);
