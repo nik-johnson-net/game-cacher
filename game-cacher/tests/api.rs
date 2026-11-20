@@ -12,6 +12,7 @@ use axum::routing::get;
 use clap::Parser;
 use game_cacher::app::{self, Overrides, RunningApp};
 use game_cacher::config::{Config, EnvSecrets};
+use game_cacher::platforms::plan::{GamePlan, Outcome};
 use game_cacher::platforms::{
     self, AuthStatus, DynPlatform, Game, LoginMethod, LoginRequest, LoginResponse, ManagedUpdates,
     Platform, PlatformCtx, UpdateReport,
@@ -114,21 +115,22 @@ impl ManagedUpdates for Fake {
             },
         ])
     }
-    async fn update_game(&self, ctx: &PlatformCtx, game_id: &str) -> Result<UpdateReport> {
+    async fn plan_game(&self, _ctx: &PlatformCtx, game_id: &str) -> Result<GamePlan> {
         tokio::time::sleep(Duration::from_millis(300)).await;
-        let w = ctx
-            .prefill
-            .warm("fake", "fake.example.com", &format!("/obj/{game_id}"))
-            .await?;
-        Ok(UpdateReport {
-            game_id: game_id.into(),
-            name: game_id.into(),
-            updated: w.bytes_downloaded > 0,
-            bytes_downloaded: w.bytes_downloaded,
-            bytes_already_cached: w.bytes_already_cached,
-            files: 1,
-            ..Default::default()
-        })
+        let mut plan = GamePlan::new("fake", game_id, game_id);
+        plan.host = "fake.example.com".into();
+        let g = plan.group("", true);
+        plan.add(format!("/obj/{game_id}"), None, g);
+        Ok(plan)
+    }
+    async fn commit(
+        &self,
+        _ctx: &PlatformCtx,
+        _plan: &GamePlan,
+        _outcome: &Outcome,
+        _report: &mut UpdateReport,
+    ) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -168,6 +170,10 @@ struct Harness {
 
 impl Harness {
     async fn new(extra: &[&str], scheduler: Duration) -> Self {
+        Self::with_storage(extra, scheduler, Arc::new(MemoryStorage::new())).await
+    }
+
+    async fn with_storage(extra: &[&str], scheduler: Duration, storage: DynStorage) -> Self {
         let up = upstream().await;
         let port = up.port().to_string();
         let mut args = vec![
@@ -197,7 +203,6 @@ impl Harness {
             admin_password: Some(PW.into()),
             ..Default::default()
         };
-        let storage: DynStorage = Arc::new(MemoryStorage::new());
         let mut list = platforms::all();
         list.push(Arc::new(Fake) as DynPlatform);
         let app = app::start(
@@ -521,10 +526,23 @@ async fn managed_updates_flow() {
     assert_eq!(s, StatusCode::CONFLICT);
 
     let st = wait_for_run(&h).await;
-    let report = &st["last_run"]["games"][0];
+    let run = &st["last_run"];
+    assert_eq!(run["status"], "ok");
+    assert_eq!(run["platform"], "fake");
+    assert_eq!(run["phase"], Value::Null);
+    assert_eq!(run["bytes_to_download"], 100 * 1024);
+    assert_eq!(run["bytes_downloaded"], 100 * 1024);
+    let report = &run["games"][0];
     assert_eq!(report["game_id"], "g1");
+    assert_eq!(report["status"], "done");
     assert_eq!(report["updated"], true);
     assert_eq!(report["bytes_downloaded"], 100 * 1024);
+    assert_eq!(report["bytes_already_cached"], 0);
+    assert_eq!(report["bytes_to_download"], 100 * 1024);
+    assert_eq!(
+        (report["objects"].clone(), report["objects_done"].clone()),
+        (json!(1), json!(1))
+    );
     assert!(!h.storage.list("cache/fake/").await.unwrap().is_empty());
     // Content warmed by the run is a HIT for LAN clients.
     let r = h.cache_get("fake.example.com", "/obj/g1").await;
@@ -539,6 +557,17 @@ async fn managed_updates_flow() {
         100 * 1024
     );
     assert_eq!(st["last_run"]["games"][0]["updated"], false);
+    assert_eq!(st["last_run"]["bytes_to_download"], 0);
+    let (_, runs) = h.get("/api/runs").await;
+    let fake: Vec<&Value> = runs
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["platform"] == "fake")
+        .collect();
+    assert_eq!(fake.len(), 2);
+    assert_eq!(fake[0]["id"], st["last_run"]["id"]);
+    assert!(fake[0]["started"].as_str() > fake[1]["started"].as_str());
     let metrics = h
         .client
         .get(h.url("/metrics"))
@@ -568,10 +597,86 @@ async fn managed_updates_flow() {
     h.app.shutdown().await;
 }
 
+#[tokio::test]
+async fn runs_can_be_cancelled() {
+    let h = Harness::new(&[], Duration::from_secs(3600)).await;
+    use reqwest::Method;
+    let cancel = "/api/platforms/fake/managed/run/cancel";
+    let (s, _) = h.send(Method::POST, cancel, Value::Null).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    h.send(
+        Method::PUT,
+        "/api/platforms/fake/managed/selection",
+        json!({"selected":["g1", "g2"]}),
+    )
+    .await;
+    h.send(Method::POST, "/api/platforms/fake/managed/run", Value::Null)
+        .await;
+    // Still checking g1 (planning takes 300 ms): the pending list is visible.
+    let (_, st) = h.get("/api/platforms/fake/managed").await;
+    assert_eq!(st["running"], true);
+    assert_eq!(st["last_run"]["status"], "running");
+    assert_eq!(st["last_run"]["games"].as_array().unwrap().len(), 2);
+    assert_eq!(st["last_run"]["games"][1]["status"], "pending");
+    let (s, r) = h.send(Method::POST, cancel, Value::Null).await;
+    assert_eq!(s, StatusCode::ACCEPTED);
+    assert_eq!(r["cancelling"], true);
+    let st = wait_for_run(&h).await;
+    assert_eq!(st["last_run"]["status"], "cancelled");
+    assert_eq!(st["last_run"]["games"][1]["status"], "cancelled");
+    assert!(h.storage.list("cache/fake/").await.unwrap().is_empty());
+    h.app.shutdown().await;
+}
+
+#[tokio::test]
+async fn interrupted_runs_are_incomplete_and_retried() {
+    let storage: DynStorage = Arc::new(MemoryStorage::new());
+    let dead = json!({"runs": [{
+        "id": "dead", "platform": "fake", "started": chrono::Utc::now(), "finished": null,
+        "status": "running", "phase": "downloading", "bytes_to_download": 10,
+        "bytes_downloaded": 5, "games": []
+    }]});
+    storage
+        .put(
+            "state/fake.runs.json",
+            serde_json::to_vec(&dead).unwrap().into(),
+        )
+        .await
+        .unwrap();
+    let h = Harness::with_storage(&[], Duration::from_millis(100), storage).await;
+    use reqwest::Method;
+    let (_, runs) = h.get("/api/runs").await;
+    assert_eq!(runs[0]["id"], "dead");
+    assert_eq!(runs[0]["status"], "incomplete");
+    h.send(
+        Method::POST,
+        "/api/platforms/fake/managed/login",
+        json!({"method":"auth_code","code":"good"}),
+    )
+    .await;
+    h.send(
+        Method::PUT,
+        "/api/platforms/fake/managed/selection",
+        json!({"selected":["g1"]}),
+    )
+    .await;
+    // The schedule's last trigger predates the dead run, but it is retried anyway.
+    let st = wait_for_run(&h).await;
+    assert_ne!(st["last_run"]["id"], "dead");
+    assert_eq!(st["last_run"]["status"], "ok");
+    let (_, runs) = h.get("/api/runs").await;
+    assert_eq!(runs.as_array().unwrap().len(), 2);
+    assert_eq!(runs[1]["status"], "incomplete");
+    h.app.shutdown().await;
+}
+
 async fn wait_for_run(h: &Harness) -> Value {
     for _ in 0..100 {
         let (_, st) = h.get("/api/platforms/fake/managed").await;
-        if st["running"] == false && st["last_run"]["finished"].is_string() {
+        if st["running"] == false
+            && st["last_run"]["finished"].is_string()
+            && st["last_run"]["id"] != "dead"
+        {
             return st;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;

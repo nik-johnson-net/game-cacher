@@ -591,6 +591,36 @@ impl CacheEngine {
 
     /// Builds a prefill target; the bool is false when the platform bypasses this path.
     /// Disabled platforms are refused so nothing is cached for them.
+    /// Fetches slices `start..` of an object that aren't stored, `WARM_PARALLELISM`
+    /// at a time, calling `downloaded` for each fetched one. Returns the bytes
+    /// that were already stored.
+    async fn warm_slices(
+        &self,
+        t: &Target,
+        meta: &Meta,
+        start: u64,
+        downloaded: &mut (dyn FnMut(u64) + Send),
+    ) -> Result<u64> {
+        let mut results = futures::stream::iter(start..meta.slice_count())
+            .map(|i| async move {
+                if self.slice_stored(t, meta, i).await {
+                    return Ok((meta.slice_len(i), true));
+                }
+                self.slice(t, meta, i)
+                    .await
+                    .map(|(b, _)| (b.len() as u64, false))
+            })
+            .buffer_unordered(WARM_PARALLELISM);
+        let mut cached = 0;
+        while let Some(res) = results.next().await {
+            match res? {
+                (n, true) => cached += n,
+                (n, false) => downloaded(n),
+            }
+        }
+        Ok(cached)
+    }
+
     async fn prefill_target(
         &self,
         identifier: &str,
@@ -709,6 +739,17 @@ async fn read_uncached(resp: reqwest::Response, range: Option<(u64, u64)>) -> Re
 #[async_trait]
 impl Prefill for CacheEngine {
     async fn warm(&self, identifier: &str, host: &str, path_and_query: &str) -> Result<WarmResult> {
+        self.warm_observed(identifier, host, path_and_query, &|_| {})
+            .await
+    }
+
+    async fn warm_observed(
+        &self,
+        identifier: &str,
+        host: &str,
+        path_and_query: &str,
+        on_download: &(dyn Fn(u64) + Send + Sync),
+    ) -> Result<WarmResult> {
         let (t, cacheable) = self
             .prefill_target(identifier, host, path_and_query)
             .await?;
@@ -717,6 +758,10 @@ impl Prefill for CacheEngine {
             return Ok(WarmResult::default());
         }
         let mut r = WarmResult::default();
+        let mut downloaded = |n: u64| {
+            r.bytes_downloaded += n;
+            on_download(n);
+        };
         let (meta, start) = match self.open(&t).await? {
             Opened::Ready { meta, fresh: None } => {
                 // Fast path: the index says every slice was written, so skip
@@ -724,8 +769,10 @@ impl Prefill for CacheEngine {
                 // would otherwise cost one storage HEAD per slice).
                 if self.index.has_all_slices(&t.prefix, meta.slice_count()) {
                     self.index.touch(&t.prefix, identifier);
-                    r.bytes_already_cached = meta.total_size;
-                    return Ok(r);
+                    return Ok(WarmResult {
+                        bytes_downloaded: 0,
+                        bytes_already_cached: meta.total_size,
+                    });
                 }
                 (meta, 0)
             }
@@ -733,12 +780,12 @@ impl Prefill for CacheEngine {
                 meta,
                 fresh: Some(f),
             } => {
-                r.bytes_downloaded += f.len() as u64;
+                downloaded(f.len() as u64);
                 (meta, 1)
             }
             Opened::Full { meta, mut body } => {
                 while let Some((_, data)) = body.next_slice(self, &t, &meta).await? {
-                    r.bytes_downloaded += data.len() as u64;
+                    downloaded(data.len() as u64);
                 }
                 return Ok(r);
             }
@@ -747,26 +794,33 @@ impl Prefill for CacheEngine {
                 resp.status()
             ),
         };
-        let mut results = futures::stream::iter(start..meta.slice_count())
-            .map(|i| {
-                let (t, meta) = (&t, &meta);
-                async move {
-                    if self.slice_stored(t, meta, i).await {
-                        return Ok((meta.slice_len(i), true));
-                    }
-                    self.slice(t, meta, i)
-                        .await
-                        .map(|(b, _)| (b.len() as u64, false))
-                }
-            })
-            .buffer_unordered(WARM_PARALLELISM);
-        while let Some(res) = results.next().await {
-            match res? {
-                (n, true) => r.bytes_already_cached += n,
-                (n, false) => r.bytes_downloaded += n,
-            }
-        }
+        r.bytes_already_cached = self.warm_slices(&t, &meta, start, &mut downloaded).await?;
         Ok(r)
+    }
+
+    fn cached_bytes(&self, identifier: &str, path_and_query: &str) -> Option<u64> {
+        let key = ObjectKey::new(identifier, path_and_query);
+        self.index.stored_bytes(&key.prefix())
+    }
+
+    async fn object_size(
+        &self,
+        identifier: &str,
+        host: &str,
+        path_and_query: &str,
+    ) -> Result<Option<u64>> {
+        let (t, cacheable) = self
+            .prefill_target(identifier, host, path_and_query)
+            .await?;
+        if !cacheable {
+            return Ok(None);
+        }
+        // Opening probes upstream for slice 0 (stored) when there is no meta yet;
+        // a full-body or uncacheable response is dropped unread.
+        Ok(match self.open(&t).await? {
+            Opened::Ready { meta, .. } | Opened::Full { meta, .. } => Some(meta.total_size),
+            Opened::Passthrough(_) => None,
+        })
     }
 
     async fn get(&self, identifier: &str, host: &str, path_and_query: &str) -> Result<Bytes> {

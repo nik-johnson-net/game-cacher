@@ -11,7 +11,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::platforms::{DynPlatform, Game, LoginRequest, LoginResponse, ManagedUpdates};
 use crate::settings::ManagedSettings;
 use crate::state::AppState;
-use crate::updates::{AlreadyRunning, ManagedStatus};
+use crate::updates::{AlreadyRunning, ManagedStatus, NotRunning, UpdateRun};
 
 fn managed(state: &AppState, id: &str) -> ApiResult<DynPlatform> {
     let p = find(state, id)?;
@@ -120,4 +120,23 @@ pub async fn run(
         }
         Err(e) => Err(e.into()),
     }
+}
+
+pub async fn cancel(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> ApiResult<(StatusCode, Json<Value>)> {
+    managed(&state, &id)?;
+    match state.updates.cancel(&id) {
+        Ok(()) => Ok((StatusCode::ACCEPTED, Json(json!({ "cancelling": true })))),
+        Err(e) if e.downcast_ref::<NotRunning>().is_some() => {
+            Err(ApiError::conflict(e.to_string()))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Recent runs of every managed platform, newest first (active runs live).
+pub async fn runs(State(state): State<Arc<AppState>>) -> ApiResult<Json<Vec<UpdateRun>>> {
+    Ok(Json(state.updates.all_runs().await?))
 }

@@ -5,6 +5,7 @@ pub mod blizzard;
 pub mod domains;
 pub mod epic;
 pub mod origin;
+pub mod plan;
 pub mod steam;
 pub mod windows_update;
 
@@ -15,6 +16,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use self::plan::{GamePlan, NoProgress, Outcome};
 use crate::secrets::DynSecrets;
 use crate::settings::SettingsStore;
 
@@ -160,6 +162,18 @@ pub struct UpdateReport {
     pub error: Option<String>,
 }
 
+impl UpdateReport {
+    /// Report for a game whose plan failed.
+    pub fn failed(game_id: &str, name: String, e: &anyhow::Error) -> Self {
+        Self {
+            game_id: game_id.to_string(),
+            name,
+            error: Some(format!("{e:#}")),
+            ..Default::default()
+        }
+    }
+}
+
 /// Result of pulling one URL through the cache.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct WarmResult {
@@ -173,6 +187,33 @@ pub struct WarmResult {
 pub trait Prefill: Send + Sync {
     /// Ensures every slice of the object is cached; does not return the body.
     async fn warm(&self, identifier: &str, host: &str, path_and_query: &str) -> Result<WarmResult>;
+    /// Like `warm`, calling `on_download` with bytes fetched upstream as they arrive.
+    async fn warm_observed(
+        &self,
+        identifier: &str,
+        host: &str,
+        path_and_query: &str,
+        on_download: &(dyn Fn(u64) + Send + Sync),
+    ) -> Result<WarmResult> {
+        let r = self.warm(identifier, host, path_and_query).await?;
+        on_download(r.bytes_downloaded);
+        Ok(r)
+    }
+    /// Bytes of the object already stored, from the in-memory index (no I/O).
+    /// None when the object isn't known.
+    fn cached_bytes(&self, _identifier: &str, _path_and_query: &str) -> Option<u64> {
+        None
+    }
+    /// The object's total size: from its stored metadata, else by fetching (and
+    /// caching) its first slice upstream. None when upstream gives no cacheable size.
+    async fn object_size(
+        &self,
+        _identifier: &str,
+        _host: &str,
+        _path_and_query: &str,
+    ) -> Result<Option<u64>> {
+        Ok(None)
+    }
     /// Returns the full body (served from cache or fetched and cached).
     /// Use for small metadata objects (manifests, configs) the platform must parse.
     async fn get(&self, identifier: &str, host: &str, path_and_query: &str) -> Result<Bytes>;
@@ -212,10 +253,57 @@ pub trait ManagedUpdates: Send + Sync {
     async fn login(&self, ctx: &PlatformCtx, req: LoginRequest) -> Result<LoginResponse>;
     async fn logout(&self, ctx: &PlatformCtx) -> Result<()>;
     async fn list_games(&self, ctx: &PlatformCtx) -> Result<Vec<Game>>;
-    /// Checks for a new version of `game_id` and prefetches its content through
-    /// `ctx.prefill`. Must be idempotent: re-running with nothing new is cheap.
-    /// Errors for a single game should be reported in `UpdateReport::error`.
-    async fn update_game(&self, ctx: &PlatformCtx, game_id: &str) -> Result<UpdateReport>;
+    /// Display name for a selected game before it is planned (no network calls).
+    async fn game_name(&self, _ctx: &PlatformCtx, game_id: &str) -> String {
+        game_id.to_string()
+    }
+    /// Checks `game_id` for a new version and lists every object of its current
+    /// content (metadata such as manifests may be fetched through `ctx.prefill`).
+    /// Every run plans the full content, so warming it verifies the cache.
+    async fn plan_game(&self, ctx: &PlatformCtx, game_id: &str) -> Result<GamePlan>;
+    /// Records what `plan` warmed in the platform state (only what `outcome`
+    /// allows, so failures are retried next run). May refine `report`.
+    async fn commit(
+        &self,
+        ctx: &PlatformCtx,
+        plan: &GamePlan,
+        outcome: &Outcome,
+        report: &mut UpdateReport,
+    ) -> Result<()>;
+    /// Builds the report for a warmed plan and commits it; commit errors become
+    /// the report's error.
+    async fn finish_game(
+        &self,
+        ctx: &PlatformCtx,
+        plan: &GamePlan,
+        outcome: &Outcome,
+    ) -> UpdateReport {
+        let mut report = outcome.report(plan);
+        if let Err(e) = self.commit(ctx, plan, outcome, &mut report).await {
+            log::warn!("{} {}: saving state: {e:#}", plan.identifier, plan.game_id);
+            report
+                .error
+                .get_or_insert_with(|| format!("saving state: {e:#}"));
+        }
+        report
+    }
+    /// Plans, warms and commits one game without progress reporting. Errors are
+    /// reported in `UpdateReport::error`.
+    async fn update_game(&self, ctx: &PlatformCtx, game_id: &str) -> Result<UpdateReport> {
+        let plan = match self.plan_game(ctx, game_id).await {
+            Ok(p) => p,
+            Err(e) => {
+                return Ok(UpdateReport::failed(
+                    game_id,
+                    self.game_name(ctx, game_id).await,
+                    &e,
+                ));
+            }
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let outcome = plan::execute(ctx.prefill.as_ref(), &plan, &NoProgress, &cancel).await;
+        Ok(self.finish_game(ctx, &plan, &outcome).await)
+    }
     /// Rejects an invalid selection before it is saved (e.g. malformed URLs for
     /// manual-list platforms). The error message is shown to the user.
     fn validate_selection(&self, _ids: &[String]) -> Result<()> {

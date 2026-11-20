@@ -43,9 +43,11 @@ game-cacher/src/
   dns.rs                   DNS server
   sni.rs                   SNI passthrough
   metrics.rs               prometheus-client registry + typed metric families
-  platforms/{mod,domains,steam/,epic/,blizzard/,origin,windows_update}.rs
+  platforms/{mod,plan,domains,steam/,epic/,blizzard/,origin,windows_update}.rs
+                           (plan.rs: GamePlan, download estimate, generic warm executor)
   schedule.rs              daily update schedule (times of day in an IANA timezone)
-  updates.rs               managed-update scheduler + job runner
+  updates/{mod,model,history,progress,runner}.rs   managed-update scheduler, run records,
+                           run history, live progress (rate/ETA), run phases
   api/{mod,auth,platforms,managed,status,settings}.rs
 game-cacher/tests/         integration tests (real listeners + reqwest)
 game-cacher-ui/            React 19 + Vite + Tailwind 4
@@ -88,7 +90,7 @@ docker/Dockerfile          multi-stage UBI10 image
 ```
 settings.json                              SettingsStore (UI-editable settings)
 state/<platform>.json                      managed-update state per platform (owned by the platform)
-state/<platform>.runs.json                 last managed-update run (UpdateManager)
+state/<platform>.runs.json                 last 10 managed-update runs (UpdateManager)
 index/lru.json                             LRU index snapshot (object → size, last_access)
 secrets/<name>.enc                         storage-backed secrets (ChaCha20-Poly1305, key from GC_SECRETS_KEY)
 cache/<identifier>/<h[0..2]>/<h[2..4]>/<h>/meta.json   object metadata
@@ -180,14 +182,56 @@ Trait `Platform` (`platforms/mod.rs`): `id`, `name`, `description`, `domains`,
 Domain lists come from uklans/cache-domains (`platforms/domains.rs`).
 
 `ManagedUpdates`: `login_methods`, `auth_status`, `login(step)`, `logout`,
-`list_games`, `update_game(game_id) -> UpdateReport`, `validate_selection`
-(Windows Update rejects non-WU URLs with 400 when the selection is saved). Platforms fetch content
-through the `Prefill` handle, which runs the request through the cache
-engine in-process (with the platform identifier), so later LAN clients hit.
+`list_games`, `game_name(game_id)` (display name before planning, no network),
+`plan_game(game_id) -> GamePlan`, `commit(plan, outcome, report)`, `validate_selection`
+(Windows Update rejects non-WU URLs with 400 when the selection is saved).
+`update_game` (plan → warm → commit, no progress) is a provided method used by tests.
+Platforms fetch content through the `Prefill` handle, which runs the request through
+the cache engine in-process (with the platform identifier), so later LAN clients hit.
 Every run re-enumerates the selected games' content and warms it, which
 verifies it against the cache: unchanged content costs only in-memory index
 lookups, and anything evicted or purged is downloaded again (`updated: true`
 with `bytes_downloaded > 0`). Prefill and runs are refused for disabled platforms.
+
+`GamePlan` (`platforms/plan.rs`): version check result (`previous_version`,
+`current_version`, `version_changed`), one CDN `host`, the objects to warm
+(`path`, listed `size` when the manifest gives one, `group`), object groups
+(`label`, `required`; Steam: one per depot, Blizzard: archives/indexes + optional
+loose files), warm `concurrency`, an optional planning `error` (e.g. one Steam depot's
+manifest failed) and an opaque payload for `commit`. `execute` warms the objects
+(failures tallied per group, never fatal; cancellation stops new and in-flight warms)
+and returns an `Outcome`; `commit` records only what the outcome allows (Steam:
+per depot; others: all-or-nothing), so failures are retried next run.
+
+`Prefill` also offers `warm_observed` (per-slice download callback, for live
+progress), `cached_bytes` (slice bytes the in-memory LRU index holds for an object,
+no I/O) and `object_size` (stored meta, else probe upstream for slice 0, which is cached).
+
+### Update runs (`updates/`)
+
+A run (one per platform at a time) goes through three phases, recorded in its
+`UpdateRun`:
+
+1. **listing**: every selected game is recorded as `pending`.
+2. **checking**: each game is planned (`checking` → `queued`, or `failed` when the
+   plan errors) and its download estimated: per object, the listed size minus
+   `cached_bytes`; objects without a listed size (Windows Update URLs, Blizzard
+   non-archive indexes, loose files when the encoding file lacks sizes) are sized
+   with `object_size`. Bytes fetched by such probes count as downloaded.
+   Blizzard archive sizes come from their indexes (end of the last blob); loose file
+   sizes from the encoding file's EKey-spec pages.
+3. **downloading**: queued games are warmed one at a time (`downloading` → `done` /
+   `failed` / `cancelled`) and committed. Rates are averaged over a sliding 20 s
+   window; ETA = estimated remaining bytes / rate, per game and for the run.
+
+Plans are kept in memory between checking and downloading (~100 B per object).
+The record is saved to `state/<platform>.runs.json` at every phase/game transition
+and every 10 s while downloading; the last 10 runs per platform are kept. A
+`running` record not backed by an active run (the process died) is shown, and
+saved on the next write, as `incomplete`. Cancel stops after dropping in-flight
+warms and nothing further is committed. In a cancelled or incomplete run, games
+that didn't finish are `cancelled` (shown as "stopped").
+Older `{"last_run": ...}` documents are read as a single run.
 
 Scheduling (`schedule.rs`, checked every 60s by `UpdateManager::tick`): the
 schedule fires every day at each of `times`, read as wall-clock time in
@@ -196,7 +240,9 @@ first occurrence fires). A platform that is enabled, has a selection and is
 logged in (if required) is due when it has never run, or when the latest
 trigger is after both the last run's `started` and the schedule's `changed`.
 So missed triggers (e.g. downtime) are caught up once, but editing the
-schedule only moves the next run. `next_run` is now when due, else the next
+schedule only moves the next run. A latest run that is `incomplete` counts as
+never run, so an interrupted run is retried on the next check (within a minute
+of startup) unless the schedule is empty. `next_run` is now when due, else the next
 trigger.
 
 | Platform | Login | Games list | Update check | Prefill |
@@ -241,6 +287,8 @@ Errors: `{"error": "message"}` with appropriate status.
 | GET | `/api/platforms/{id}/managed/games` | `[Game]` |
 | PUT | `/api/platforms/{id}/managed/selection` | `{"selected":[game_id]}` → `ManagedStatus` (400 if the platform rejects an entry, e.g. a non-WU URL) |
 | POST | `/api/platforms/{id}/managed/run` | start update run now → 202 `{"started": true}` (409 if running or the platform is disabled) |
+| POST | `/api/platforms/{id}/managed/run/cancel` | cancel the active run → 202 `{"cancelling": true}` (409 if none is running) |
+| GET | `/api/runs` | `[UpdateRun]`: the last 10 runs of every managed platform, newest first; active runs live |
 | GET | `/api/settings` | `{"update_schedule":{"timezone","times":["HH:MM"]}}` |
 | PUT | `/api/settings` | same → same, normalized (400 on an unknown IANA timezone, a time not exactly `HH:MM`, or times less than 5 minutes apart, also across midnight) |
 
@@ -249,7 +297,8 @@ PlatformSummary = { id, name, description, enabled, domains: [str], managed: boo
   stats: { requests, hits, misses, bypass, bytes_from_cache, bytes_from_upstream,
            storage_bytes, objects } }
 ManagedStatus = { auth: AuthStatus, login_methods: [LoginMethod], selected: [str],
-  running: bool, last_run: UpdateRun | null, next_run: rfc3339 | null }
+  running: bool, last_run: UpdateRun | null (latest run, live while running),
+  next_run: rfc3339 | null }
 AuthStatus = { logged_in: bool, account: str | null, required: bool, auth_url?: str }
 LoginMethod = "none" | "qr" | "password" | "auth_code" | "manual_list"
 LoginRequest = {"method":"qr"} | {"method":"qr_poll","challenge_id"} |
@@ -261,9 +310,18 @@ LoginResponse = {"status":"logged_in","account"} | {"status":"qr","challenge_id"
   (device_confirmation: the UI polls with qr_poll + challenge_id; a qr_poll may return a new "qr" url when Steam rotates it)
 AuthStatus.auth_url (optional): where to obtain an auth code (Epic)
 Game = { id, name, version: str | null, size_bytes: u64 | null, selected: bool }
-UpdateRun = { started, finished: rfc3339 | null, games: [UpdateReport] }
+UpdateRun = { id, platform, started, finished: rfc3339 | null,
+  status: "running" | "ok" | "error" | "cancelled" | "incomplete",
+  phase: "listing" | "checking" | "downloading" | null,
+  bytes_to_download, bytes_downloaded,          (sums over games)
+  rate_bps: u64 | null, eta_secs: u64 | null,   (live, while downloading)
+  games: [GameRun] }
+GameRun = UpdateReport + { status: "pending" | "checking" | "queued" | "downloading" |
+  "done" | "failed" | "cancelled", bytes_to_download: u64 | null (estimate, once checked),
+  objects, objects_done, rate_bps: u64 | null, eta_secs: u64 | null }
 UpdateReport = { game_id, name, previous_version, current_version, updated: bool,
   bytes_downloaded, bytes_already_cached, files, error: str | null }
+  (bytes_downloaded grows live while the game downloads)
 ```
 
 ## Metrics (OpenMetrics, prefix `gamecacher_`)
@@ -275,4 +333,4 @@ UpdateReport = { game_id, name, previous_version, current_version, updated: bool
 - `evictions_total{platform}` counter
 - `dns_queries_total{result=override|forward|refused|error}` counter
 - `sni_connections_total{result=ok|error|loop|rejected}` counter, `sni_active_connections` gauge
-- `managed_update_runs_total{platform,result=ok|error}`, `managed_update_bytes_total{platform}` counters
+- `managed_update_runs_total{platform,result=ok|error|cancelled}`, `managed_update_bytes_total{platform}` counters

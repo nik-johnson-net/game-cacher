@@ -34,6 +34,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/platforms/{id}/managed/games", get(managed::games))
         .route("/platforms/{id}/managed/selection", put(managed::selection))
         .route("/platforms/{id}/managed/run", post(managed::run))
+        .route("/platforms/{id}/managed/run/cancel", post(managed::cancel))
+        .route("/runs", get(managed::runs))
         .route(
             "/settings",
             get(settings::get_settings).put(settings::put_settings),

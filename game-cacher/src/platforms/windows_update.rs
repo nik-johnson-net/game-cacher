@@ -8,6 +8,7 @@ use super::{
     AuthStatus, CachePolicy, Game, LoginMethod, LoginRequest, LoginResponse, ManagedUpdates,
     Platform, PlatformCtx, UpdateReport, domains, host_matches,
 };
+use crate::platforms::plan::{GamePlan, Outcome};
 
 pub struct WindowsUpdate {}
 
@@ -145,38 +146,40 @@ impl ManagedUpdates for WindowsUpdate {
         Ok(())
     }
 
-    async fn update_game(&self, ctx: &PlatformCtx, game_id: &str) -> Result<UpdateReport> {
-        let mut report = UpdateReport {
-            game_id: game_id.to_string(),
-            name: file_name(game_id),
-            ..Default::default()
-        };
+    async fn game_name(&self, _ctx: &PlatformCtx, game_id: &str) -> String {
+        file_name(game_id)
+    }
+
+    async fn plan_game(&self, ctx: &PlatformCtx, game_id: &str) -> Result<GamePlan> {
+        let (host, pq) = parse_target(game_id).map_err(anyhow::Error::msg)?;
+        let state = ctx.state.load().await?;
+        let mut plan = GamePlan::new(Self::ID, game_id, &file_name(game_id));
+        plan.previous_version = state[game_id]["size"].as_u64().map(|s| s.to_string());
+        plan.host = host;
+        plan.concurrency = 1;
+        let g = plan.group("", true);
+        plan.add(pq, None, g);
+        Ok(plan)
+    }
+
+    async fn commit(
+        &self,
+        ctx: &PlatformCtx,
+        plan: &GamePlan,
+        outcome: &Outcome,
+        report: &mut UpdateReport,
+    ) -> Result<()> {
+        if !outcome.succeeded(plan) {
+            return Ok(());
+        }
+        let size = outcome.bytes_downloaded + outcome.bytes_already_cached;
+        report.current_version = Some(size.to_string());
         let mut state = ctx.state.load().await?;
         if !state.is_object() {
             state = json!({});
         }
-        report.previous_version = state[game_id]["size"].as_u64().map(|s| s.to_string());
-        let (host, pq) = match parse_target(game_id) {
-            Ok(t) => t,
-            Err(e) => {
-                report.error = Some(e);
-                return Ok(report);
-            }
-        };
-        match ctx.prefill.warm(self.id(), &host, &pq).await {
-            Ok(w) => {
-                report.bytes_downloaded = w.bytes_downloaded;
-                report.bytes_already_cached = w.bytes_already_cached;
-                report.files = 1;
-                report.updated = w.bytes_downloaded > 0;
-                let size = w.bytes_downloaded + w.bytes_already_cached;
-                report.current_version = Some(size.to_string());
-                state[game_id] = json!({ "size": size });
-                ctx.state.save(&state).await?;
-            }
-            Err(e) => report.error = Some(format!("{e:#}")),
-        }
-        Ok(report)
+        state[&plan.game_id] = json!({ "size": size });
+        ctx.state.save(&state).await
     }
 }
 

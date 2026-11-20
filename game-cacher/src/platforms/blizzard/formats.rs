@@ -1,5 +1,6 @@
 //! TACT binary formats: BLTE containers, the encoding file and CDN archive indices.
 
+use std::collections::HashMap;
 use std::io::Read;
 
 use anyhow::{Result, bail, ensure};
@@ -54,36 +55,93 @@ pub fn decode_blte(data: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Layout of an (already BLTE-decoded) encoding file, from its 22-byte header.
+struct EncodingLayout {
+    ckey_size: usize,
+    ekey_size: usize,
+    ckey_page: usize,
+    ekey_page: usize,
+    ckey_pages: usize,
+    ekey_pages: usize,
+    /// Offset of the first CEKey page.
+    ckey_start: usize,
+}
+
+impl EncodingLayout {
+    fn parse(data: &[u8]) -> Result<Self> {
+        ensure!(slice(data, 0, 2)? == b"EN", "not an encoding file");
+        let h = slice(data, 0, 22)?;
+        let (ckey_size, ekey_size) = (h[3] as usize, h[4] as usize);
+        let ckey_pages = be(&h[9..13]) as usize;
+        let espec_size = be(&h[18..22]) as usize;
+        Ok(Self {
+            ckey_size,
+            ekey_size,
+            ckey_page: be(&h[5..7]) as usize * 1024,
+            ekey_page: be(&h[7..9]) as usize * 1024,
+            ckey_pages,
+            ekey_pages: be(&h[13..17]) as usize,
+            ckey_start: 22 + espec_size + ckey_pages * (ckey_size + 16),
+        })
+    }
+
+    /// Offset of the first EKey-spec page (after the CEKey pages and the EKey page index).
+    fn ekey_start(&self) -> usize {
+        self.ckey_start + self.ckey_pages * self.ckey_page + self.ekey_pages * (self.ekey_size + 16)
+    }
+}
+
 /// All encoding keys listed in an (already BLTE-decoded) encoding file's CEKey pages.
 pub fn encoding_ekeys(data: &[u8]) -> Result<Vec<Vec<u8>>> {
-    ensure!(slice(data, 0, 2)? == b"EN", "not an encoding file");
-    let h = slice(data, 0, 22)?;
-    let (ckey_size, ekey_size) = (h[3] as usize, h[4] as usize);
-    let page_size = be(&h[5..7]) as usize * 1024;
-    let page_count = be(&h[9..13]) as usize;
-    let espec_size = be(&h[18..22]) as usize;
-    let index_entry = ckey_size + 16;
-    let pages_start = 22 + espec_size + page_count * index_entry;
+    let l = EncodingLayout::parse(data)?;
     let mut out = Vec::new();
-    for p in 0..page_count {
-        let page = slice(data, pages_start + p * page_size, page_size)?;
+    for p in 0..l.ckey_pages {
+        let page = slice(data, l.ckey_start + p * l.ckey_page, l.ckey_page)?;
         let mut pos = 0;
         while let Some(&keys) = page.get(pos) {
             if keys == 0 {
                 break;
             }
-            pos += 1 + 5 + ckey_size;
+            pos += 1 + 5 + l.ckey_size;
             for _ in 0..keys {
-                out.push(slice(page, pos, ekey_size)?.to_vec());
-                pos += ekey_size;
+                out.push(slice(page, pos, l.ekey_size)?.to_vec());
+                pos += l.ekey_size;
             }
         }
     }
     Ok(out)
 }
 
-/// Keys of all entries in a CDN archive `.index` file.
-pub fn index_keys(data: &[u8]) -> Result<Vec<Vec<u8>>> {
+/// Encoded (download) size per encoding key, from the encoding file's EKey-spec
+/// pages: entries of ekey, espec index (u32) and size (40-bit), zero-padded.
+pub fn encoding_sizes(data: &[u8]) -> Result<HashMap<Vec<u8>, u64>> {
+    let l = EncodingLayout::parse(data)?;
+    let entry = l.ekey_size + 4 + 5;
+    let mut out = HashMap::new();
+    for p in 0..l.ekey_pages {
+        let page = slice(data, l.ekey_start() + p * l.ekey_page, l.ekey_page)?;
+        for e in page.chunks_exact(entry) {
+            let key = &e[..l.ekey_size];
+            if key.iter().all(|&b| b == 0) {
+                break;
+            }
+            out.insert(key.to_vec(), be(&e[l.ekey_size + 4..]));
+        }
+    }
+    Ok(out)
+}
+
+/// A parsed CDN archive `.index` file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ArchiveIndex {
+    /// Keys of all entries.
+    pub keys: Vec<Vec<u8>>,
+    /// Size of the archive the index describes (end of its last blob).
+    pub archive_size: u64,
+}
+
+/// Parses a CDN archive `.index` file (entries: key, size, offset; big-endian).
+pub fn parse_index(data: &[u8]) -> Result<ArchiveIndex> {
     // Footer: toc_hash[cs], version, 2 reserved, block_size_kb, offset_bytes, size_bytes,
     // key_size, checksum_size, num_elements (LE u32), footer_hash[cs]. checksum_size
     // is 8 in practice but also locates itself, so probe for a consistent value.
@@ -111,10 +169,17 @@ pub fn index_keys(data: &[u8]) -> Result<Vec<Vec<u8>>> {
     let entry = key_size + size_bytes + offset_bytes;
     ensure!(entry > 0 && block_size >= entry, "invalid index geometry");
     let per_block = block_size / entry;
-    let mut out = Vec::with_capacity(count.min(1 << 20));
+    let mut out = ArchiveIndex {
+        keys: Vec::with_capacity(count.min(1 << 20)),
+        archive_size: 0,
+    };
     for i in 0..count {
         let start = (i / per_block) * block_size + (i % per_block) * entry;
-        out.push(slice(data, start, key_size)?.to_vec());
+        let e = slice(data, start, entry)?;
+        let size = be(&e[key_size..key_size + size_bytes]);
+        let offset = be(&e[key_size + size_bytes..]);
+        out.keys.push(e[..key_size].to_vec());
+        out.archive_size = out.archive_size.max(offset + size);
     }
     Ok(out)
 }
@@ -179,7 +244,7 @@ pub mod testing {
         out.extend(page_kb.to_be_bytes());
         out.extend(page_kb.to_be_bytes());
         out.extend((pages.len() as u32).to_be_bytes());
-        out.extend(0u32.to_be_bytes());
+        out.extend(1u32.to_be_bytes()); // one EKey-spec page
         out.push(0);
         let espec = b"z\0";
         out.extend((espec.len() as u32).to_be_bytes());
@@ -199,19 +264,35 @@ pub mod testing {
             page.resize(page_kb as usize * 1024, 0);
             out.extend(page);
         }
+        // EKey page index (unused by the parser), then one page: every ekey with
+        // encoded size 0x100 + its first byte.
+        out.extend([0u8; 32]);
+        let mut page = Vec::new();
+        for (_, ekeys) in pages.iter().flatten() {
+            for e in ekeys {
+                page.extend(e);
+                page.extend(0u32.to_be_bytes());
+                page.extend((0x100 + u64::from(e[0])).to_be_bytes()[3..].iter());
+            }
+        }
+        page.resize(page_kb as usize * 1024, 0);
+        out.extend(page);
         out
     }
 
-    /// Archive index with 4 KiB blocks, 16-byte keys, 4-byte sizes and offsets.
+    /// Archive index with 4 KiB blocks, 16-byte keys, 4-byte sizes and offsets:
+    /// each blob is 100 bytes, laid out back to back.
     pub fn index(keys: &[[u8; 16]]) -> Vec<u8> {
         let per_block = 4096 / 24;
         let mut out = Vec::new();
+        let mut offset = 0u32;
         for chunk in keys.chunks(per_block) {
             let mut block = Vec::new();
             for k in chunk {
                 block.extend(k);
                 block.extend(100u32.to_be_bytes());
-                block.extend(0u32.to_be_bytes());
+                block.extend(offset.to_be_bytes());
+                offset += 100;
             }
             block.resize(4096, 0);
             out.extend(block);
@@ -268,7 +349,19 @@ mod tests {
             ]
         );
         assert!(encoding_ekeys(b"XX").is_err());
-        assert!(encoding_ekeys(&data[..data.len() - 1500]).is_err());
+        assert!(encoding_ekeys(&data[..data.len() - 2500]).is_err());
+    }
+
+    #[test]
+    fn encoding_sizes_from_ekey_pages() {
+        let k = |n: u8| [n; 16];
+        let data = encoding(&[vec![(k(1), vec![k(0xa1), k(0xa2)])]]);
+        let sizes = encoding_sizes(&data).unwrap();
+        assert_eq!(sizes.len(), 2);
+        assert_eq!(sizes[&k(0xa1).to_vec()], 0x1a1);
+        assert_eq!(sizes[&k(0xa2).to_vec()], 0x1a2);
+        assert!(encoding_sizes(b"XX").is_err());
+        assert!(encoding_sizes(&data[..data.len() - 100]).is_err());
     }
 
     #[test]
@@ -280,15 +373,16 @@ mod tests {
                 k
             })
             .collect();
-        let parsed = index_keys(&index(&keys)).unwrap();
-        assert_eq!(parsed.len(), 400);
-        assert_eq!(parsed[0], keys[0].to_vec());
-        assert_eq!(parsed[399], keys[399].to_vec());
-        assert_eq!(index_keys(&index(&[])).unwrap().len(), 0);
-        assert!(index_keys(&[0u8; 10]).is_err());
+        let parsed = parse_index(&index(&keys)).unwrap();
+        assert_eq!(parsed.keys.len(), 400);
+        assert_eq!(parsed.keys[0], keys[0].to_vec());
+        assert_eq!(parsed.keys[399], keys[399].to_vec());
+        assert_eq!(parsed.archive_size, 400 * 100);
+        assert_eq!(parse_index(&index(&[])).unwrap(), ArchiveIndex::default());
+        assert!(parse_index(&[0u8; 10]).is_err());
         let mut bad = index(&keys);
         bad.drain(..4096);
-        assert!(index_keys(&bad).is_err());
+        assert!(parse_index(&bad).is_err());
     }
 }
 
@@ -312,7 +406,7 @@ mod live {
         assert!(ekeys.len() > 100, "encoding ekeys: {}", ekeys.len());
         assert!(ekeys.iter().all(|k| k.len() == 16));
         let idx = std::fs::read(dir.join("archive.index")).unwrap();
-        let keys = index_keys(&idx).unwrap();
+        let keys = parse_index(&idx).unwrap().keys;
         assert!(!keys.is_empty());
         assert!(keys.iter().all(|k| k.len() == 16));
         // Entries are sorted by key, which checks the block/entry geometry.
@@ -322,7 +416,11 @@ mod live {
         let mut archived = std::collections::HashSet::new();
         if let Ok(entries) = std::fs::read_dir(dir.join("idx")) {
             for e in entries {
-                archived.extend(index_keys(&std::fs::read(e.unwrap().path()).unwrap()).unwrap());
+                archived.extend(
+                    parse_index(&std::fs::read(e.unwrap().path()).unwrap())
+                        .unwrap()
+                        .keys,
+                );
             }
         }
         if !archived.is_empty() {

@@ -274,6 +274,14 @@ impl LruIndex {
         }
     }
 
+    /// Slice bytes stored for an object (excluding its meta.json), if it is indexed.
+    pub fn stored_bytes(&self, object_prefix: &str) -> Option<u64> {
+        self.lock()
+            .objects
+            .get(&Key::find(object_prefix))
+            .map(|e| e.bytes.saturating_sub(e.meta_bytes))
+    }
+
     /// True if every slice `0..count` is known to be stored.
     pub fn has_all_slices(&self, object_prefix: &str, count: u64) -> bool {
         self.lock()
@@ -654,6 +662,21 @@ mod tests {
             "oldest evicted"
         );
         task.abort();
+    }
+
+    #[tokio::test]
+    async fn stored_bytes_excludes_meta() {
+        let storage: DynStorage = Arc::new(MemoryStorage::new());
+        let idx = index(&storage, None).await;
+        let p = "cache/steam/aa/bb/obj";
+        assert_eq!(idx.stored_bytes(p), None);
+        idx.record_meta(p, "steam", 300);
+        assert_eq!(idx.stored_bytes(p), Some(0));
+        idx.record_slice(p, "steam", 0, 100);
+        idx.record_slice(p, "steam", 1, 50);
+        assert_eq!(idx.stored_bytes(p), Some(150));
+        idx.remove_object(p);
+        assert_eq!(idx.stored_bytes(p), None);
     }
 
     #[tokio::test]

@@ -1,108 +1,126 @@
-//! Update check + prefill for one app: PICS build id → changed depot manifests
-//! → manifest download → chunk warm-up through the cache.
+//! Update check + plan for one app: PICS build id → selected depot manifests →
+//! one object group of chunks per depot.
 
 use std::collections::{BTreeMap, HashMap};
 
-use anyhow::{Context, Result, anyhow, bail};
-use futures::StreamExt;
+use anyhow::{Context, Result, bail};
 
 use super::appinfo::{self, AppInfo, DepotPlan, PUBLIC_BRANCH};
 use super::backend::{CdnServer, SteamSession};
-use super::manifest;
+use super::manifest::{self, Manifest};
 use super::state::AppState;
-use crate::platforms::{Prefill, UpdateReport};
+use crate::platforms::Prefill;
+use crate::platforms::plan::{GamePlan, Outcome};
 
 pub const IDENTIFIER: &str = super::Steam::ID;
-/// Concurrent chunk warm-ups per depot.
+/// Concurrent chunk warm-ups.
 const CHUNK_CONCURRENCY: usize = 16;
 
-/// Checks `app_id` against `previous` and warms every selected depot through the
-/// cache, even when the build id is unchanged: already-cached chunks are cheap
-/// and anything evicted is re-downloaded (verification/repair). Returns the
-/// report and the state to persist. Depot failures are recorded in the report
-/// (first error) and leave that depot's previous gid in place so it is retried;
-/// the new build id is only recorded once every depot succeeded.
-pub async fn update_app(
+/// What `next_state` needs after the warm.
+struct Payload {
+    previous: AppState,
+    buildid: String,
+    depots: Vec<PlannedDepot>,
+}
+
+struct PlannedDepot {
+    key: String,
+    gid: String,
+    /// The depot's object group; None when its manifest could not be planned.
+    group: Option<u16>,
+}
+
+/// Plans `app_id` against `previous`: every selected depot's chunks, even when
+/// the build id is unchanged (already-cached chunks are cheap and anything
+/// evicted is re-downloaded). A depot whose manifest fails is recorded as the
+/// plan's error and keeps its previous gid.
+pub async fn plan_app(
     session: &dyn SteamSession,
     prefill: &dyn Prefill,
     app_id: u32,
     previous: &AppState,
-) -> Result<(UpdateReport, AppState)> {
+) -> Result<GamePlan> {
     let app = fetch_app(session, app_id).await?;
     let buildid = app
         .public_buildid
         .clone()
         .with_context(|| format!("app {app_id} has no public branch build id"))?;
-    let mut report = UpdateReport {
-        game_id: app_id.to_string(),
-        name: app.name.clone(),
-        previous_version: previous.buildid.clone(),
-        current_version: Some(buildid.clone()),
-        ..Default::default()
-    };
-    let build_changed = previous.buildid.as_deref() != Some(buildid.as_str());
-
-    let plans = plan_depots(session, &app).await?;
-    let (depots, error) =
-        prefill_plans(session, prefill, app_id, &plans, previous, &mut report).await;
-    // A build change, or any bytes fetched while verifying (cache evicted or
-    // purged), counts as an update.
-    report.updated = build_changed || report.bytes_downloaded > 0;
-    // Until every depot succeeds, keep the old build id so the next run retries.
-    let buildid = if error.is_none() {
-        Some(buildid)
-    } else {
-        previous.buildid.clone()
-    };
-    report.error = error;
-    Ok((report, AppState { buildid, depots }))
+    let mut plan = GamePlan::new(IDENTIFIER, &app_id.to_string(), &app.name);
+    plan.previous_version = previous.buildid.clone();
+    plan.current_version = Some(buildid.clone());
+    plan.version_changed = previous.buildid.as_deref() != Some(buildid.as_str());
+    plan.concurrency = CHUNK_CONCURRENCY;
+    let mut depots = Vec::new();
+    for dp in plan_depots(session, &app).await? {
+        let group = match plan_depot(session, prefill, app_id, &dp, &mut plan).await {
+            Ok(g) => Some(g),
+            Err(e) => {
+                log::warn!("steam app {app_id} depot {}: {e:#}", dp.depot_id);
+                plan.error
+                    .get_or_insert_with(|| format!("depot {}: {e:#}", dp.depot_id));
+                None
+            }
+        };
+        depots.push(PlannedDepot {
+            key: dp.depot_id.to_string(),
+            gid: dp.manifest_gid.to_string(),
+            group,
+        });
+    }
+    plan.payload = Box::new(Payload {
+        previous: previous.clone(),
+        buildid,
+        depots,
+    });
+    Ok(plan)
 }
 
-/// Prefetches every plan (changed or not, to verify the cache), accumulating
-/// into `report`. Returns the depot → gid map to persist and the first error.
-async fn prefill_plans(
+/// Adds one depot's chunks as a new object group; returns the group.
+async fn plan_depot(
     session: &dyn SteamSession,
     prefill: &dyn Prefill,
     app_id: u32,
-    plans: &[DepotPlan],
-    previous: &AppState,
-    report: &mut UpdateReport,
-) -> (BTreeMap<String, String>, Option<String>) {
+    dp: &DepotPlan,
+    plan: &mut GamePlan,
+) -> Result<u16> {
+    if plan.host.is_empty() {
+        plan.host = pick_cdn_host(&session.cdn_servers().await?, app_id)
+            .context("no usable Steam CDN server")?;
+    }
+    let manifest = fetch_manifest(session, prefill, &plan.host, dp).await?;
+    let group = plan.group(format!("depot {}", dp.depot_id), true);
+    for c in manifest.chunks {
+        let path = format!("/depot/{}/chunk/{}", dp.depot_id, c.sha);
+        plan.add(path, Some(c.compressed_size.into()), group);
+    }
+    Ok(group)
+}
+
+/// State to persist after warming `plan`, or None when it is unchanged. Depots
+/// whose chunks all warmed record their new gid, the rest keep the previous one;
+/// the build id only advances once everything succeeded.
+pub fn next_state(plan: &GamePlan, outcome: &Outcome) -> Option<AppState> {
+    let p = plan.payload::<Payload>()?;
     let mut depots = BTreeMap::new();
-    let mut cdn: Option<String> = None;
-    let mut first_error = None;
-    for plan in plans {
-        let key = plan.depot_id.to_string();
-        let gid = plan.manifest_gid.to_string();
-        let result = async {
-            let host = match &cdn {
-                Some(h) => h.clone(),
-                None => {
-                    let h = pick_cdn_host(&session.cdn_servers().await?, app_id)
-                        .context("no usable Steam CDN server")?;
-                    cdn.insert(h).clone()
-                }
-            };
-            prefill_depot(session, prefill, &host, plan).await
-        }
-        .await;
-        match result {
-            Ok(depot) => {
-                report.files += depot.chunks;
-                report.bytes_downloaded += depot.bytes_downloaded;
-                report.bytes_already_cached += depot.bytes_already_cached;
-                depots.insert(key, gid);
+    for d in &p.depots {
+        match d.group {
+            Some(g) if outcome.group_ok(g) => {
+                depots.insert(d.key.clone(), d.gid.clone());
             }
-            Err(e) => {
-                log::warn!("steam app {app_id} depot {}: {e:#}", plan.depot_id);
-                first_error.get_or_insert(format!("depot {}: {e:#}", plan.depot_id));
-                if let Some(old) = previous.depots.get(&key) {
-                    depots.insert(key, old.clone());
+            _ => {
+                if let Some(old) = p.previous.depots.get(&d.key) {
+                    depots.insert(d.key.clone(), old.clone());
                 }
             }
         }
     }
-    (depots, first_error)
+    let buildid = if outcome.succeeded(plan) {
+        Some(p.buildid.clone())
+    } else {
+        p.previous.buildid.clone()
+    };
+    let next = AppState { buildid, depots };
+    (next != p.previous).then_some(next)
 }
 
 async fn fetch_app(session: &dyn SteamSession, app_id: u32) -> Result<AppInfo> {
@@ -156,19 +174,12 @@ pub fn pick_cdn_host(servers: &[CdnServer], app_id: u32) -> Option<String> {
         })
 }
 
-#[derive(Debug, Default)]
-struct DepotResult {
-    chunks: u64,
-    bytes_downloaded: u64,
-    bytes_already_cached: u64,
-}
-
-async fn prefill_depot(
+async fn fetch_manifest(
     session: &dyn SteamSession,
     prefill: &dyn Prefill,
     host: &str,
     plan: &DepotPlan,
-) -> Result<DepotResult> {
+) -> Result<Manifest> {
     let code = session
         .manifest_request_code(
             plan.containing_app,
@@ -189,42 +200,5 @@ async fn prefill_depot(
         .get(IDENTIFIER, host, &path)
         .await
         .context("downloading manifest")?;
-    let manifest = manifest::parse(&body).context("parsing manifest")?;
-
-    let paths: Vec<String> = manifest
-        .chunks
-        .iter()
-        .map(|sha| format!("/depot/{}/chunk/{sha}", plan.depot_id))
-        .collect();
-    let mut results = futures::stream::iter(paths)
-        .map(|path| async move {
-            prefill
-                .warm(IDENTIFIER, host, &path)
-                .await
-                .with_context(|| format!("GET {path}"))
-        })
-        .buffer_unordered(CHUNK_CONCURRENCY);
-    let mut out = DepotResult::default();
-    let mut failures = 0usize;
-    let mut first_error = None;
-    while let Some(r) = results.next().await {
-        match r {
-            Ok(w) => {
-                out.chunks += 1;
-                out.bytes_downloaded += w.bytes_downloaded;
-                out.bytes_already_cached += w.bytes_already_cached;
-            }
-            Err(e) => {
-                failures += 1;
-                first_error.get_or_insert(e);
-            }
-        }
-    }
-    match first_error {
-        None => Ok(out),
-        Some(e) => Err(anyhow!(
-            "{failures} of {} chunks failed: {e:#}",
-            manifest.chunks.len()
-        )),
-    }
+    manifest::parse(&body).context("parsing manifest")
 }

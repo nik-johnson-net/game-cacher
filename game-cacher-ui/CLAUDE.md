@@ -4,7 +4,7 @@
 - Pages live in `src/pages/`, page-specific components in `src/components/<area>/` (`managed/` for managed updates), shared primitives in `src/components/ui/`.
 - The UI talks only to the REST API in `../docs/ARCHITECTURE.md` "REST API (admin listener)" — that section is the contract. Types in `src/api/types.ts` are copied from it; keep them in sync and never change the contract from here.
 - Dev server: `npm run dev` proxies `/api`, `/metrics`, `/healthz` to the Rust admin listener on `http://127.0.0.1:8080`.
-- No backend handy? `npm run dev:mock` serves a stateful in-memory mock of `/api` from `mock/` (platform toggles, QR / password+guard / auth-code sign-in flows, update runs). `MOCK_AUTH=1 npm run dev:mock` also requires the admin password `admin`. It is a Vite dev-server plugin, never part of the production bundle. Update `mock/` when the contract changes.
+- No backend handy? `npm run dev:mock` serves a stateful in-memory mock of `/api` from `mock/` (platform toggles, QR / password+guard / auth-code sign-in flows, update runs with simulated phases, progress and cancel, seeded run history). `MOCK_AUTH=1 npm run dev:mock` also requires the admin password `admin`. It is a Vite dev-server plugin, never part of the production bundle. Update `mock/` when the contract changes.
 
 # UI DEVELOPMENT
 
@@ -26,7 +26,7 @@ All UI changes follow `DESIGN.md` (tokens, components, status mappings, page lay
 ## Data fetching
 - `src/api/client.ts`: one typed function per endpoint. Non-2xx throws `ApiError` (`status` + the server's `{"error"}` message; status 0 = network error). Handles JSON and `204`. No `any`.
 - `usePolling(fn, intervalMs, enabled)` (`src/hooks/usePolling.ts`) for everything: `intervalMs = 0` loads once. Memoize `fn` with `useCallback`; changing it refetches. Use `setData` to apply a mutation's response.
-- Dashboard/platform lists poll every 5 s; managed status polls every 2 s while a run is active, 15 s otherwise. QR / device-approval sign-in polls `qr_poll` every 2 s from `auth-panel.tsx`.
+- Dashboard/platform lists poll every 5 s; managed status and `/api/runs` poll every 2 s while a run is active (15 s / 5 s on the dashboard otherwise). QR / device-approval sign-in polls `qr_poll` every 2 s from `auth-panel.tsx`.
 - Toasts: `useToast().push({ variant, title, message })`.
 
 ## Conventions
