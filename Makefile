@@ -1,4 +1,4 @@
-.PHONY: check fmt test test-s3 ui docker
+.PHONY: check fmt test test-s3 ui docker stack-up stack-down
 
 check:
 	cargo fmt --check
@@ -17,6 +17,13 @@ ui:
 
 docker:
 	docker build -f docker/Dockerfile -t game-cacher:dev .
+
+# Local S3 + Vault stack in a podman pod (no compose needed); see dev/stack.sh.
+stack-up: docker
+	dev/stack.sh up
+
+stack-down:
+	dev/stack.sh down
 
 # S3 storage conformance against a throwaway SeaweedFS container.
 test-s3:

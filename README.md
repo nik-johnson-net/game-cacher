@@ -52,8 +52,11 @@ Then:
 1. Point your LAN's DHCP DNS server at `192.168.1.10`.
 2. Open `http://192.168.1.10:8080` and sign in with the admin password.
 
-`dev/compose.yaml` runs a full local stack with S3 (SeaweedFS) and Vault
-storage on non-privileged ports.
+For a full local stack with S3 (SeaweedFS) storage and Vault secrets on
+non-privileged ports, run `make stack-up` (UI at `http://127.0.0.1:8080`,
+password `admin`; `make stack-down` stops it). It uses a single podman pod, so it
+works in rootless and nested podman where compose does not. `dev/compose.yaml`
+is the same stack for Docker Compose.
 
 ## Configuration
 
@@ -97,6 +100,7 @@ The API accepts `Authorization: Bearer $GC_ADMIN_PASSWORD` for scripting.
 ```sh
 make check   # fmt, clippy, tests, UI lint + build
 cargo test   # Rust unit + integration tests
+make stack-up   # build the image and run it with S3 + Vault (dev/stack.sh)
 cd game-cacher-ui && npm run dev:mock   # UI against a mock API
 ```
 

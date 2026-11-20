@@ -1,5 +1,6 @@
 # Local stack for development and end-to-end testing: game-cacher with S3 storage
-# (SeaweedFS) and Vault secrets (dev mode).
+# (SeaweedFS) and Vault secrets (dev mode). Without compose (e.g. rootless or
+# nested podman) use dev/stack.sh, which runs the same stack in one pod.
 #
 #   docker build -f docker/Dockerfile -t game-cacher:dev .
 #   docker compose -f dev/compose.yaml up -d
