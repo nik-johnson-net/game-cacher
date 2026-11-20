@@ -10,6 +10,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use super::Entry;
 use super::compact::Key;
 
+/// The only snapshot format version; anything else is rebuilt from storage.
+const VERSION: u32 = 1;
 /// Rough JSON size of one object, to size the output buffer up front.
 const BYTES_PER_OBJECT: usize = 170;
 
@@ -48,7 +50,7 @@ pub(super) fn encode(objects: &HashMap<Key, Entry>) -> serde_json::Result<Vec<u8
     serde_json::to_writer(
         &mut out,
         &Snapshot {
-            version: 1,
+            version: VERSION,
             objects: Objects(objects),
         },
     )?;
@@ -78,13 +80,20 @@ impl<'de> Visitor<'de> for SnapshotSeed {
         f.write_str("an LRU index snapshot")
     }
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-        let mut objects = None;
+        let (mut version, mut objects) = (None, None);
         while let Some(k) = map.next_key::<String>()? {
-            if k == "objects" {
-                objects = Some(map.next_value_seed(ObjectsSeed)?);
-            } else {
-                map.next_value::<IgnoredAny>()?;
+            match k.as_str() {
+                "version" => version = Some(map.next_value::<u32>()?),
+                "objects" => objects = Some(map.next_value_seed(ObjectsSeed)?),
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
             }
+        }
+        match version {
+            Some(VERSION) => {}
+            Some(v) => return Err(de::Error::custom(format!("unsupported version {v}"))),
+            None => return Err(de::Error::missing_field("version")),
         }
         objects.ok_or_else(|| de::Error::missing_field("objects"))
     }
@@ -174,7 +183,11 @@ mod tests {
     fn rejects_garbage() {
         assert!(decode(b"nope").is_err());
         assert!(decode(br#"{"version":1}"#).is_err());
-        assert!(decode(br#"{"objects":{}} trailing"#).is_err());
-        assert!(decode(br#"{"objects":{"p":{"bytes":1}}}"#).is_err());
+        assert!(decode(br#"{"version":1,"objects":{}} trailing"#).is_err());
+        assert!(decode(br#"{"version":1,"objects":{"p":{"bytes":1}}}"#).is_err());
+        // Version must be present and supported (it may come after objects).
+        assert!(decode(br#"{"objects":{}}"#).is_err());
+        assert!(decode(br#"{"version":2,"objects":{}}"#).is_err());
+        assert!(decode(br#"{"objects":{},"version":1}"#).unwrap().is_empty());
     }
 }

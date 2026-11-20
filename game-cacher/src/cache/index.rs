@@ -187,12 +187,18 @@ impl LruIndex {
 
     /// Marks an object as used now.
     pub fn touch(&self, object_prefix: &str, identifier: &str) {
+        if self.is_evicting(object_prefix) {
+            return;
+        }
         self.lock().touch(Key::new(object_prefix, identifier));
         self.dirty.store(true, Ordering::Relaxed);
     }
 
     /// Records `bytes` newly stored for an object and touches it.
     pub fn record_write(&self, object_prefix: &str, identifier: &str, bytes: u64) {
+        if self.is_evicting(object_prefix) {
+            return;
+        }
         let mut inner = self.lock();
         inner.touch(Key::new(object_prefix, identifier)).bytes += bytes;
         inner.total += bytes;
@@ -222,6 +228,9 @@ impl LruIndex {
 
     /// Records the object's meta.json size, replacing any previous value.
     pub fn record_meta(&self, object_prefix: &str, identifier: &str, bytes: u64) {
+        if self.is_evicting(object_prefix) {
+            return;
+        }
         let mut inner = self.lock();
         let e = inner.touch(Key::new(object_prefix, identifier));
         let old = std::mem::replace(&mut e.meta_bytes, bytes);
@@ -709,6 +718,9 @@ mod tests {
         idx.evicting_prefixes.lock().unwrap().insert(p.to_string());
         idx.record_slice(p, "steam", 0, 100);
         idx.mark_slice(p, "steam", 1);
+        idx.record_meta(p, "steam", 300);
+        idx.record_write(p, "steam", 10);
+        idx.touch(p, "steam");
         assert_eq!(idx.usage().objects, 0);
         assert!(!idx.has_all_slices(p, 1));
         idx.evicting_prefixes.lock().unwrap().clear();
