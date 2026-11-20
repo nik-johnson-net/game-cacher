@@ -161,7 +161,10 @@ Unknown/missing platforms default to enabled; missing `managed` entries default 
     whole objects oldest-first down to 90% of max. The index also keeps an
     in-memory bitset of stored slices per object (rebuilt from listings and
     reads); `Prefill::warm` skips per-slice storage checks only when every
-    slice bit is set.
+    slice bit is set. Entries are kept compact (interned identifier + 32-byte
+    object hash, inline first bitset word) since a large cache holds millions;
+    the snapshot is serialized straight from the map and read entry by entry,
+    never copying the whole index.
 
 ## Platforms
 
