@@ -171,10 +171,19 @@ impl SecretStore for VaultSecrets {
         Ok(())
     }
 
+    /// Deletes every version through `metadata/`. Policies that only grant
+    /// `data/` (e.g. Nomad's default workload policy) get a 403 there, so fall
+    /// back to a soft delete of the latest version, which reads then return 404.
     async fn delete(&self, name: &str) -> Result<()> {
-        let resp = self
+        let mut resp = self
             .send(Method::DELETE, &self.url("metadata", name)?, None)
             .await?;
+        if resp.status() == StatusCode::FORBIDDEN {
+            log::debug!("Vault metadata delete of {name} forbidden; soft-deleting");
+            resp = self
+                .send(Method::DELETE, &self.url("data", name)?, None)
+                .await?;
+        }
         if resp.status() == StatusCode::NOT_FOUND {
             return Ok(());
         }
@@ -256,6 +265,42 @@ mod tests {
         let s = token_store(&server).await;
         s.put("x", "v").await.unwrap();
         s.delete("x").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_falls_back_to_soft_delete_when_metadata_forbidden() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .and(path("/v1/secret/metadata/gc/x"))
+            .respond_with(
+                ResponseTemplate::new(403).set_body_json(json!({"errors": ["permission denied"]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/v1/secret/data/gc/x"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let s = token_store(&server).await;
+        s.delete("x").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn delete_errors_when_soft_delete_also_forbidden() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(
+                ResponseTemplate::new(403).set_body_json(json!({"errors": ["permission denied"]})),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let s = token_store(&server).await;
+        let err = s.delete("x").await.unwrap_err().to_string();
+        assert!(err.contains("permission denied"), "{err}");
     }
 
     #[tokio::test]
