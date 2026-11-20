@@ -54,9 +54,10 @@ Then:
 
 For a full local stack with S3 (SeaweedFS) storage and Vault secrets on
 non-privileged ports, run `make stack-up` (UI at `http://127.0.0.1:8080`,
-password `admin`; `make stack-down` stops it). It uses a single podman pod, so it
-works in rootless and nested podman where compose does not. `dev/compose.yaml`
-is the same stack for Docker Compose.
+password `admin`; `make stack-down` stops it). It uses a single podman pod. The
+same stack is in `dev/compose.yaml` for `docker compose` / `podman compose`. It
+uses no bridge network, so it also works in rootless and nested podman; with
+real Docker set `GC_NETWORK_MODE=bridge`. Allow ~15 s for SeaweedFS to start.
 
 ## Configuration
 
