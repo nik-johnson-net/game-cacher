@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { NavLink, useNavigate } from "react-router";
-import { Activity, Gamepad2, LayoutDashboard, LogOut, Settings } from "lucide-react";
+import { Activity, Gamepad2, History, LayoutDashboard, LogOut, Settings } from "lucide-react";
 import { logout } from "@/api/client";
 import { useAuth } from "@/context/auth";
 import { useToast } from "@/context/toast";
@@ -17,6 +17,7 @@ interface NavItem {
 const mainNavItems: NavItem[] = [
   { title: "Dashboard", href: "/", icon: LayoutDashboard, end: true },
   { title: "Platforms", href: "/platforms", icon: Gamepad2 },
+  { title: "Runs", href: "/runs", icon: History },
 ];
 
 const bottomNavItems: NavItem[] = [{ title: "Settings", href: "/settings", icon: Settings }];

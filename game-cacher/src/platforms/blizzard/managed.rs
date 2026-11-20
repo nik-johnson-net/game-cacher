@@ -1,5 +1,7 @@
 //! Blizzard managed updates: poll the TACT patch server, then warm the build's CDN objects.
 
+use std::collections::{HashMap, HashSet};
+
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use futures::stream::{self, StreamExt};
@@ -8,6 +10,7 @@ use serde_json::{Value, json};
 use super::formats;
 use super::tact::{self, cdn_path, parse_bpsv, parse_config, values};
 use super::{Blizzard, domains};
+use crate::platforms::plan::{GamePlan, Outcome};
 use crate::platforms::{
     AuthStatus, Game, LoginMethod, LoginRequest, LoginResponse, ManagedUpdates, PlatformCtx,
     UpdateReport, host_matches,
@@ -57,8 +60,8 @@ fn pick_host(hosts: &str) -> String {
 /// CDN object paths (excluding the two configs) to warm for a build, deduplicated in order.
 fn plan_paths(
     path: &str,
-    build: &std::collections::HashMap<String, String>,
-    cdn: &std::collections::HashMap<String, String>,
+    build: &HashMap<String, String>,
+    cdn: &HashMap<String, String>,
 ) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut add = |p: Option<String>| out.extend(p);
@@ -83,7 +86,7 @@ fn plan_paths(
             add(cdn_path(path, "data", ekey, ""));
         }
     }
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     out.retain(|p| seen.insert(p.clone()));
     out
 }
@@ -110,172 +113,197 @@ impl Blizzard {
         Ok(parse_bpsv(&text))
     }
 
-    async fn run_update(
+    /// `(BuildConfig, CDNConfig, VersionsName)` currently published for `REGION`.
+    async fn current_version(
         &self,
         ctx: &PlatformCtx,
         product: &str,
-        report: &mut UpdateReport,
-    ) -> Result<()> {
+    ) -> Result<(String, String, String)> {
         let versions = self.fetch_table(ctx, product, "versions").await?;
         let Some(v) = versions.region(REGION) else {
             bail!("no versions listed for {product}");
         };
-        let field = |m: &std::collections::HashMap<String, String>, k: &str| {
-            m.get(k).cloned().unwrap_or_default()
-        };
-        let (build_hash, cdn_hash, version) = (
-            field(v, "BuildConfig"),
-            field(v, "CDNConfig"),
-            field(v, "VersionsName"),
-        );
-        if build_hash.is_empty() || cdn_hash.is_empty() {
+        let field = |k: &str| v.get(k).cloned().unwrap_or_default();
+        let (build, cdn) = (field("BuildConfig"), field("CDNConfig"));
+        if build.is_empty() || cdn.is_empty() {
             bail!("versions for {product} lack BuildConfig/CDNConfig");
         }
-        report.current_version = Some(version.clone());
+        Ok((build, cdn, field("VersionsName")))
+    }
 
-        let mut state = ctx.state.load().await?;
-        let prev = state.get(product).cloned().unwrap_or(Value::Null);
-        report.previous_version = prev["version"].as_str().map(str::to_string);
-        let changed =
-            prev["build_config"] != build_hash.as_str() || prev["cdn_config"] != cdn_hash.as_str();
-
+    /// `(host, path)` of the CDN to fetch `product` from.
+    async fn cdn(&self, ctx: &PlatformCtx, product: &str) -> Result<(String, String)> {
         let cdns = self.fetch_table(ctx, product, "cdns").await?;
         let Some(c) = cdns.region(REGION) else {
             bail!("no cdns listed for {product}");
         };
-        let (host, path) = (pick_host(&field(c, "Hosts")), field(c, "Path"));
+        let path = c.get("Path").cloned().unwrap_or_default();
         if path.is_empty() {
             bail!("cdns for {product} lack Path");
         }
+        Ok((pick_host(c.get("Hosts").map_or("", String::as_str)), path))
+    }
 
-        let get_cfg = |hash: String| {
-            let host = host.clone();
-            let path = path.clone();
-            async move {
-                let p = cdn_path(&path, "config", &hash, "")
-                    .with_context(|| format!("bad config hash {hash:?}"))?;
-                let body = ctx
-                    .prefill
-                    .get(IDENTIFIER, &host, &p)
-                    .await
-                    .with_context(|| p.clone())?;
-                Ok::<_, anyhow::Error>(parse_config(&String::from_utf8_lossy(&body)))
-            }
-        };
-        let build_cfg = get_cfg(build_hash.clone()).await?;
-        let cdn_cfg = get_cfg(cdn_hash.clone()).await?;
+    /// Plans the build's full object set: when nothing changed these are cache hits,
+    /// and anything evicted or purged is fetched again.
+    async fn plan(&self, ctx: &PlatformCtx, product: &str) -> Result<GamePlan> {
+        let (build_hash, cdn_hash, version) = self.current_version(ctx, product).await?;
+        let mut plan = GamePlan::new(IDENTIFIER, product, &product_name(product));
+        let state = ctx.state.load().await?;
+        let prev = state.get(product).cloned().unwrap_or(Value::Null);
+        plan.previous_version = prev["version"].as_str().map(str::to_string);
+        plan.current_version = Some(version.clone());
+        plan.version_changed =
+            prev["build_config"] != build_hash.as_str() || prev["cdn_config"] != cdn_hash.as_str();
 
-        // Every run warms the full object set: when nothing changed these are cache hits
-        // (`bytes_already_cached`), and anything evicted or purged is fetched again.
+        let (host, path) = self.cdn(ctx, product).await?;
+        let build_cfg = get_config(ctx, &host, &path, &build_hash).await?;
+        let cdn_cfg = get_config(ctx, &host, &path, &cdn_hash).await?;
         let planned = plan_paths(&path, &build_cfg, &cdn_cfg);
-        self.warm_all(ctx, &host, planned.clone(), report, true)
-            .await;
-        match self
-            .loose_paths(ctx, &host, &path, &build_cfg, &cdn_cfg, &planned)
+        let contents = contents(ctx, &host, &path, &build_cfg, &cdn_cfg, &planned)
             .await
-        {
-            Ok(loose) => self.warm_all(ctx, &host, loose, report, false).await,
-            Err(e) => {
-                report
-                    .error
-                    .get_or_insert_with(|| format!("loose files: {e:#}"));
-            }
-        }
-        if report.error.is_none() && changed {
-            // Failed objects leave the state untouched so the next run retries.
-            state[product] = json!({
-                "build_config": build_hash,
-                "cdn_config": cdn_hash,
-                "version": version,
-                "updated_at": chrono::Utc::now().to_rfc3339(),
+            .unwrap_or_else(|e| {
+                plan.error = Some(format!("loose files: {e:#}"));
+                Contents::default()
             });
-            ctx.state.save(&state).await?;
+        let (archives, loose) = (plan.group("", true), plan.group("loose files", false));
+        for p in planned {
+            let size = contents.archive_sizes.get(&p).copied();
+            plan.add(p, size, archives);
         }
-        report.updated = changed || report.bytes_downloaded > 0;
-        Ok(())
+        for (p, size) in contents.loose {
+            plan.add(p, size, loose);
+        }
+        plan.host = host;
+        plan.concurrency = WARM_CONCURRENCY;
+        plan.payload = Box::new(Payload {
+            build_config: build_hash,
+            cdn_config: cdn_hash,
+            version,
+        });
+        Ok(plan)
     }
+}
 
-    /// Data paths of files stored outside archives: encoding-file ekeys not in any archive
-    /// index and not already planned. Empty when the build has no encoding file.
-    async fn loose_paths(
-        &self,
-        ctx: &PlatformCtx,
-        host: &str,
-        path: &str,
-        build: &std::collections::HashMap<String, String>,
-        cdn: &std::collections::HashMap<String, String>,
-        planned: &[String],
-    ) -> Result<Vec<String>> {
-        let enc_key = values(build, "encoding").get(1).map(|k| k.to_string());
-        let Some(enc) = enc_key.and_then(|k| cdn_path(path, "data", &k, "")) else {
-            return Ok(Vec::new());
-        };
-        let body = ctx.prefill.get(IDENTIFIER, host, &enc).await?;
-        let ekeys = formats::encoding_ekeys(&formats::decode_blte(&body).context(enc.clone())?)
-            .context("parsing encoding file")?;
+/// Archive sizes (from their indexes) and loose files: encoding-file ekeys not
+/// in any archive index and not already planned, with their encoded sizes.
+async fn contents(
+    ctx: &PlatformCtx,
+    host: &str,
+    path: &str,
+    build: &HashMap<String, String>,
+    cdn: &HashMap<String, String>,
+    planned: &[String],
+) -> Result<Contents> {
+    let (archive_sizes, archived) = archive_indexes(ctx, host, path, cdn).await?;
+    let loose = loose_files(ctx, host, path, build, &archived, planned).await?;
+    Ok(Contents {
+        archive_sizes,
+        loose,
+    })
+}
 
-        let mut index_paths: Vec<String> = Vec::new();
-        for a in values(cdn, "archives") {
-            index_paths.extend(cdn_path(path, "data", a, ".index"));
-        }
-        let mut archived = std::collections::HashSet::new();
-        let prefill = ctx.prefill.clone();
-        let mut indices = stream::iter(index_paths)
-            .map(|p| {
-                let prefill = prefill.clone();
-                let host = host.to_string();
-                async move {
-                    let body = prefill.get(IDENTIFIER, &host, &p).await?;
-                    formats::index_keys(&body).with_context(|| p)
-                }
-            })
-            .buffer_unordered(WARM_CONCURRENCY);
-        while let Some(keys) = indices.next().await {
-            archived.extend(keys?);
-        }
-
-        let planned: std::collections::HashSet<&String> = planned.iter().collect();
-        let mut seen = std::collections::HashSet::new();
-        Ok(ekeys
-            .into_iter()
-            .filter(|k| !archived.contains(k) && seen.insert(k.clone()))
-            .filter_map(|k| cdn_path(path, "data", &hex::encode(k), ""))
-            .filter(|p| !planned.contains(p))
-            .collect())
-    }
-
-    async fn warm_all(
-        &self,
-        ctx: &PlatformCtx,
-        host: &str,
-        paths: Vec<String>,
-        report: &mut UpdateReport,
-        fatal: bool,
-    ) {
-        let mut results = stream::iter(paths)
-            .map(|p| async move {
-                ctx.prefill
-                    .warm(IDENTIFIER, host, &p)
-                    .await
-                    .map_err(|e| e.context(p))
-            })
-            .buffer_unordered(WARM_CONCURRENCY);
-        while let Some(r) = results.next().await {
-            match r {
-                Ok(w) => {
-                    report.files += 1;
-                    report.bytes_downloaded += w.bytes_downloaded;
-                    report.bytes_already_cached += w.bytes_already_cached;
-                }
-                Err(e) => {
-                    log::warn!("blizzard warm failed: {e:#}");
-                    if fatal {
-                        report.error.get_or_insert_with(|| format!("{e:#}"));
-                    }
-                }
+/// Parses every archive index: archive data path → size, and all archived ekeys.
+async fn archive_indexes(
+    ctx: &PlatformCtx,
+    host: &str,
+    path: &str,
+    cdn: &HashMap<String, String>,
+) -> Result<(HashMap<String, u64>, HashSet<Vec<u8>>)> {
+    let archives: Vec<(String, String)> = values(cdn, "archives")
+        .into_iter()
+        .filter_map(|a| {
+            Some((
+                cdn_path(path, "data", a, "")?,
+                cdn_path(path, "data", a, ".index")?,
+            ))
+        })
+        .collect();
+    let prefill = ctx.prefill.clone();
+    let mut indices = stream::iter(archives)
+        .map(|(data, idx)| {
+            let prefill = prefill.clone();
+            let host = host.to_string();
+            async move {
+                let body = prefill.get(IDENTIFIER, &host, &idx).await?;
+                let parsed = formats::parse_index(&body).with_context(|| idx)?;
+                Ok::<_, anyhow::Error>((data, parsed))
             }
-        }
+        })
+        .buffer_unordered(WARM_CONCURRENCY);
+    let (mut sizes, mut archived) = (HashMap::new(), HashSet::new());
+    while let Some(r) = indices.next().await {
+        let (data, index) = r?;
+        sizes.insert(data, index.archive_size);
+        archived.extend(index.keys);
     }
+    Ok((sizes, archived))
+}
+
+/// Data paths of encoding-file ekeys stored outside archives and not already
+/// planned, with their encoded size when the encoding file lists it. Empty when
+/// the build has no encoding file.
+async fn loose_files(
+    ctx: &PlatformCtx,
+    host: &str,
+    path: &str,
+    build: &HashMap<String, String>,
+    archived: &HashSet<Vec<u8>>,
+    planned: &[String],
+) -> Result<Vec<(String, Option<u64>)>> {
+    let enc_key = values(build, "encoding").get(1).map(|k| k.to_string());
+    let Some(enc) = enc_key.and_then(|k| cdn_path(path, "data", &k, "")) else {
+        return Ok(Vec::new());
+    };
+    let body = ctx.prefill.get(IDENTIFIER, host, &enc).await?;
+    let decoded = formats::decode_blte(&body).context(enc.clone())?;
+    let ekeys = formats::encoding_ekeys(&decoded).context("parsing encoding file")?;
+    let sizes = formats::encoding_sizes(&decoded).unwrap_or_else(|e| {
+        log::warn!("blizzard: encoded sizes unavailable ({e:#}); loose files are probed");
+        HashMap::new()
+    });
+    let planned: HashSet<&String> = planned.iter().collect();
+    let mut seen = HashSet::new();
+    Ok(ekeys
+        .into_iter()
+        .filter(|k| !archived.contains(k) && seen.insert(k.clone()))
+        .filter_map(|k| {
+            let p = cdn_path(path, "data", &hex::encode(&k), "")?;
+            (!planned.contains(&p)).then(|| (p, sizes.get(&k).copied()))
+        })
+        .collect())
+}
+
+/// Fetches and parses a build or CDN config.
+async fn get_config(
+    ctx: &PlatformCtx,
+    host: &str,
+    path: &str,
+    hash: &str,
+) -> Result<HashMap<String, String>> {
+    let p =
+        cdn_path(path, "config", hash, "").with_context(|| format!("bad config hash {hash:?}"))?;
+    let body = ctx
+        .prefill
+        .get(IDENTIFIER, host, &p)
+        .await
+        .with_context(|| p.clone())?;
+    Ok(parse_config(&String::from_utf8_lossy(&body)))
+}
+
+/// State recorded once a build is fully warmed.
+struct Payload {
+    build_config: String,
+    cdn_config: String,
+    version: String,
+}
+
+#[derive(Default)]
+struct Contents {
+    /// Archive data path → size.
+    archive_sizes: HashMap<String, u64>,
+    /// Loose file data paths with their encoded size, when known.
+    loose: Vec<(String, Option<u64>)>,
 }
 
 #[async_trait]
@@ -317,16 +345,36 @@ impl ManagedUpdates for Blizzard {
             .collect())
     }
 
-    async fn update_game(&self, ctx: &PlatformCtx, game_id: &str) -> Result<UpdateReport> {
-        let mut report = UpdateReport {
-            game_id: game_id.to_string(),
-            name: product_name(game_id),
-            ..Default::default()
+    async fn game_name(&self, _ctx: &PlatformCtx, game_id: &str) -> String {
+        product_name(game_id)
+    }
+
+    async fn plan_game(&self, ctx: &PlatformCtx, game_id: &str) -> Result<GamePlan> {
+        self.plan(ctx, game_id).await
+    }
+
+    async fn commit(
+        &self,
+        ctx: &PlatformCtx,
+        plan: &GamePlan,
+        outcome: &Outcome,
+        _report: &mut UpdateReport,
+    ) -> Result<()> {
+        // Failed objects leave the state untouched so the next run retries.
+        let Some(p) = plan.payload::<Payload>() else {
+            return Ok(());
         };
-        if let Err(e) = self.run_update(ctx, game_id, &mut report).await {
-            report.error = Some(format!("{e:#}"));
+        if !outcome.succeeded(plan) || !plan.version_changed {
+            return Ok(());
         }
-        Ok(report)
+        let mut state = ctx.state.load().await?;
+        state[&plan.game_id] = json!({
+            "build_config": p.build_config,
+            "cdn_config": p.cdn_config,
+            "version": p.version,
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        });
+        ctx.state.save(&state).await
     }
 }
 

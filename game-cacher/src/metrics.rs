@@ -224,8 +224,8 @@ impl Metrics {
         self.sni_active.inc_by(delta);
     }
 
-    pub fn update_run(&self, platform: &str, ok: bool) {
-        let result = if ok { "ok" } else { "error" };
+    /// `result`: `ok`, `error` or `cancelled`.
+    pub fn update_run(&self, platform: &str, result: &str) {
         self.update_runs
             .get_or_create(&RequestLabels {
                 platform: platform.into(),

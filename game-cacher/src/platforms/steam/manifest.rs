@@ -1,7 +1,7 @@
 //! Depot manifest parsing (format per SteamKit2 `DepotManifest`): the CDN
 //! serves a zip with one entry holding magic-prefixed protobuf sections.
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
 
 use anyhow::{Context, Result, bail};
@@ -22,10 +22,18 @@ const MAX_MANIFEST_BYTES: u64 = 512 * 1024 * 1024;
 pub struct Manifest {
     pub depot_id: u32,
     pub gid: u64,
-    /// Unique chunk SHA-1 ids, lowercase hex, sorted.
-    pub chunks: Vec<String>,
+    /// Unique chunks, sorted by SHA-1.
+    pub chunks: Vec<Chunk>,
     /// Sum of compressed sizes of the unique chunks.
     pub compressed_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Chunk {
+    /// SHA-1 id, lowercase hex.
+    pub sha: String,
+    /// Download (compressed) size.
+    pub compressed_size: u32,
 }
 
 /// Parses a manifest as downloaded from `/depot/<id>/manifest/<gid>/5/<code>`.
@@ -76,22 +84,27 @@ pub fn parse_raw(data: &[u8]) -> Result<Manifest> {
     let payload = payload.context("manifest has no payload section")?;
     let metadata = metadata.context("manifest has no metadata section")?;
 
-    let mut seen = BTreeSet::new();
-    let mut compressed_bytes = 0u64;
+    let mut seen = BTreeMap::new();
     for chunk in payload.mappings.iter().flat_map(|m| m.chunks.iter()) {
         let sha = chunk.sha();
         if sha.len() != 20 {
             bail!("chunk with invalid sha length {}", sha.len());
         }
-        if seen.insert(hex::encode(sha)) {
-            compressed_bytes += u64::from(chunk.cb_compressed());
-        }
+        seen.entry(hex::encode(sha))
+            .or_insert_with(|| chunk.cb_compressed());
     }
+    let chunks: Vec<Chunk> = seen
+        .into_iter()
+        .map(|(sha, compressed_size)| Chunk {
+            sha,
+            compressed_size,
+        })
+        .collect();
     Ok(Manifest {
         depot_id: metadata.depot_id(),
         gid: metadata.gid_manifest(),
-        chunks: seen.into_iter().collect(),
-        compressed_bytes,
+        compressed_bytes: chunks.iter().map(|c| u64::from(c.compressed_size)).sum(),
+        chunks,
     })
 }
 
@@ -164,10 +177,9 @@ pub(crate) mod tests {
         let m = parse(&zipped).unwrap();
         assert_eq!(m.depot_id, 731);
         assert_eq!(m.gid, 99);
-        assert_eq!(
-            m.chunks,
-            vec![hex::encode(c), hex::encode(b), hex::encode(a)]
-        );
+        let shas: Vec<&str> = m.chunks.iter().map(|c| c.sha.as_str()).collect();
+        assert_eq!(shas, vec![hex::encode(c), hex::encode(b), hex::encode(a)]);
+        assert!(m.chunks.iter().all(|c| c.compressed_size == 100));
         assert_eq!(m.compressed_bytes, 300);
     }
 

@@ -12,6 +12,7 @@ import Dashboard from "./pages/Dashboard.tsx";
 import Login from "./pages/Login.tsx";
 import Platforms from "./pages/Platforms.tsx";
 import PlatformDetail from "./pages/PlatformDetail.tsx";
+import Runs from "./pages/Runs.tsx";
 import SettingsPage from "./pages/Settings.tsx";
 import NotFound from "./pages/NotFound.tsx";
 
@@ -23,6 +24,7 @@ const router = createBrowserRouter([
       { index: true, Component: Dashboard },
       { path: "/platforms", Component: Platforms },
       { path: "/platforms/:id", Component: PlatformDetail },
+      { path: "/runs", Component: Runs },
       { path: "/settings", Component: SettingsPage },
       { path: "*", Component: NotFound },
     ],

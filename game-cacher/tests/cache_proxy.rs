@@ -863,3 +863,63 @@ async fn prefill() {
     assert!(e.warm("epic", EPIC, "/missing").await.is_err());
     assert!(e.get("nope", EPIC, "/obj/1").await.is_err());
 }
+
+#[tokio::test]
+async fn prefill_sizing_and_progress() {
+    let h = harness().await;
+    let e = h.engine.clone();
+    let path = "/obj/200000";
+    assert_eq!(e.cached_bytes("epic", path), None);
+
+    // Sizing an unknown object fetches (and stores) only its first slice.
+    assert_eq!(
+        e.object_size("epic", EPIC, path).await.unwrap(),
+        Some(200000)
+    );
+    assert_eq!(h.count(path), 1);
+    assert_eq!(e.cached_bytes("epic", "/obj/200000?sig=2"), Some(SLICE));
+    // Known now: answered from stored metadata, no upstream request.
+    assert_eq!(
+        e.object_size("epic", EPIC, path).await.unwrap(),
+        Some(200000)
+    );
+    assert_eq!(h.count(path), 1);
+
+    // Progress callbacks add up to the downloaded bytes.
+    let seen = std::sync::atomic::AtomicU64::new(0);
+    let on = |n: u64| {
+        seen.fetch_add(n, std::sync::atomic::Ordering::SeqCst);
+    };
+    let r = e.warm_observed("epic", EPIC, path, &on).await.unwrap();
+    assert_eq!(
+        (r.bytes_downloaded, r.bytes_already_cached),
+        (200000 - SLICE, SLICE)
+    );
+    assert_eq!(
+        seen.load(std::sync::atomic::Ordering::SeqCst),
+        r.bytes_downloaded
+    );
+    assert_eq!(e.cached_bytes("epic", path), Some(200000));
+
+    // Fresh object (slice 0 fetched by the warm itself) and a range-ignoring upstream.
+    for p in ["/obj/150000", "/norange/100000"] {
+        seen.store(0, std::sync::atomic::Ordering::SeqCst);
+        let r = e.warm_observed("epic", EPIC, p, &on).await.unwrap();
+        assert!(r.bytes_downloaded > 0, "{p}");
+        assert_eq!(
+            seen.load(std::sync::atomic::Ordering::SeqCst),
+            r.bytes_downloaded,
+            "{p}"
+        );
+    }
+
+    // Not cacheable: missing upstream, bypassed path; unknown platform errors.
+    assert_eq!(e.object_size("epic", EPIC, "/missing").await.unwrap(), None);
+    assert_eq!(
+        e.object_size("windowsupdate", WSUS, "/x/authrootstl.cab")
+            .await
+            .unwrap(),
+        None
+    );
+    assert!(e.object_size("nope", EPIC, path).await.is_err());
+}

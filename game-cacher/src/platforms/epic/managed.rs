@@ -5,12 +5,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
-use futures::StreamExt;
 use serde_json::{Value, json};
 
 use super::Epic;
 use super::client::{self, Asset, Client, ManifestEntry, Rejected};
 use super::manifest;
+use crate::platforms::plan::{GamePlan, Outcome};
 use crate::platforms::{
     AuthStatus, Game, LoginMethod, LoginRequest, LoginResponse, ManagedUpdates, PlatformCtx,
     UpdateReport, domains, host_matches,
@@ -181,42 +181,7 @@ impl Epic {
         Ok(assets)
     }
 
-    async fn warm_all(
-        &self,
-        ctx: &PlatformCtx,
-        host: &str,
-        base: &str,
-        m: &manifest::Manifest,
-        report: &mut UpdateReport,
-    ) {
-        let paths = m.chunk_paths();
-        let mut results = futures::stream::iter(paths)
-            .map(|p| async move {
-                let url = format!("{base}/{p}");
-                (url.clone(), ctx.prefill.warm(IDENTIFIER, host, &url).await)
-            })
-            .buffer_unordered(WARM_CONCURRENCY);
-        while let Some((url, res)) = results.next().await {
-            match res {
-                Ok(w) => {
-                    report.bytes_downloaded += w.bytes_downloaded;
-                    report.bytes_already_cached += w.bytes_already_cached;
-                }
-                Err(e) => {
-                    log::warn!("epic: chunk {url} failed: {e:#}");
-                    report.error.get_or_insert_with(|| format!("{url}: {e:#}"));
-                }
-            }
-        }
-        report.files = m.chunks.len() as u64;
-    }
-
-    async fn run_update(
-        &self,
-        ctx: &PlatformCtx,
-        app: &str,
-        report: &mut UpdateReport,
-    ) -> Result<()> {
+    async fn plan(&self, ctx: &PlatformCtx, app: &str) -> Result<GamePlan> {
         let token = self.access_token(ctx).await?;
         let assets = self.fresh_assets(ctx, &token).await?;
         let asset = assets
@@ -224,16 +189,14 @@ impl Epic {
             .find(|a| a.app_name == app)
             .ok_or_else(|| anyhow!("game {app} not found in your Epic library"))?;
         let state = ctx.state.load().await?;
-        if let Some(t) = state["assets"][app]["title"].as_str() {
-            report.name = t.to_string();
-        }
+        let name = state["assets"][app]["title"].as_str().unwrap_or(app);
+        let mut plan = GamePlan::new(IDENTIFIER, app, name);
         let previous = state["games"][app]["build_version"]
             .as_str()
             .map(String::from);
-        report.previous_version = previous.clone();
-        report.current_version = Some(asset.build_version.clone());
-        // Every run re-warms all chunks (cache hits when nothing changed), which
-        // verifies the cached data and repairs evicted or purged chunks.
+        plan.version_changed = previous.as_deref() != Some(asset.build_version.as_str());
+        plan.previous_version = previous;
+        plan.current_version = Some(asset.build_version.clone());
         let entries = self.api(ctx).manifests(&token, asset).await?;
         let (host, pq, base) = pick_manifest(&entries)?;
         let raw = ctx
@@ -242,17 +205,14 @@ impl Epic {
             .await
             .context("downloading manifest")?;
         let m = manifest::parse(&raw).context("parsing manifest")?;
-        self.warm_all(ctx, &host, &base, &m, report).await;
-        let changed = previous.as_deref() != Some(asset.build_version.as_str());
-        report.updated = changed || report.bytes_downloaded > 0;
-        if report.error.is_none() && changed {
-            // Reload: the warm above can take long and other writers may have saved meanwhile.
-            let _guard = self.state_lock.lock().await;
-            let mut state = ctx.state.load().await?;
-            state["games"][app] = json!({"build_version": asset.build_version});
-            ctx.state.save(&state).await?;
+        let g = plan.group("", true);
+        for (chunk, path) in m.chunks.iter().zip(m.chunk_paths()) {
+            let size = u64::try_from(chunk.file_size).ok().filter(|&s| s > 0);
+            plan.add(format!("{base}/{path}"), size, g);
         }
-        Ok(())
+        plan.host = host;
+        plan.concurrency = WARM_CONCURRENCY;
+        Ok(plan)
     }
 }
 
@@ -362,16 +322,33 @@ impl ManagedUpdates for Epic {
         Ok(games)
     }
 
-    async fn update_game(&self, ctx: &PlatformCtx, game_id: &str) -> Result<UpdateReport> {
-        let mut report = UpdateReport {
-            game_id: game_id.to_string(),
-            name: game_id.to_string(),
-            ..Default::default()
-        };
-        if let Err(e) = self.run_update(ctx, game_id, &mut report).await {
-            report.error = Some(format!("{e:#}"));
+    async fn game_name(&self, ctx: &PlatformCtx, game_id: &str) -> String {
+        let state = ctx.state.load().await.unwrap_or_default();
+        state["assets"][game_id]["title"]
+            .as_str()
+            .unwrap_or(game_id)
+            .to_string()
+    }
+
+    async fn plan_game(&self, ctx: &PlatformCtx, game_id: &str) -> Result<GamePlan> {
+        self.plan(ctx, game_id).await
+    }
+
+    async fn commit(
+        &self,
+        ctx: &PlatformCtx,
+        plan: &GamePlan,
+        outcome: &Outcome,
+        _report: &mut UpdateReport,
+    ) -> Result<()> {
+        if !outcome.succeeded(plan) || !plan.version_changed {
+            return Ok(());
         }
-        Ok(report)
+        // Reload: the warm can take long and other writers may have saved meanwhile.
+        let _guard = self.state_lock.lock().await;
+        let mut state = ctx.state.load().await?;
+        state["games"][&plan.game_id] = json!({ "build_version": plan.current_version });
+        ctx.state.save(&state).await
     }
 }
 

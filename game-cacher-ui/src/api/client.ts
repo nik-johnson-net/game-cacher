@@ -12,6 +12,7 @@ import type {
   PlatformSummary,
   PurgeResult,
   Settings,
+  UpdateRun,
 } from "./types";
 
 /** Thrown for every non-2xx response (and for network failures, with status 0). */
@@ -188,4 +189,13 @@ export function saveSelection(id: string, selected: string[]): Promise<ManagedSt
 
 export function runManaged(id: string): Promise<{ started: boolean }> {
   return json<{ started: boolean }>(`/api/platforms/${seg(id)}/managed/run`, { method: "POST" });
+}
+
+export function cancelRun(id: string): Promise<{ cancelling: boolean }> {
+  return json<{ cancelling: boolean }>(`/api/platforms/${seg(id)}/managed/run/cancel`, { method: "POST" });
+}
+
+/** Last runs of every managed platform, newest first (active runs live). */
+export function listRuns(signal?: AbortSignal): Promise<UpdateRun[]> {
+  return json<UpdateRun[]>("/api/runs", { signal });
 }

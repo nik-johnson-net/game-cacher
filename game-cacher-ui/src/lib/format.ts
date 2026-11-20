@@ -26,6 +26,12 @@ export function formatBytes(bytes: number | null | undefined): string {
   return `${sig3(value)} ${BYTE_UNITS[unit]}`;
 }
 
+/** Transfer rate: 12_300_000 → "12.3 MB/s"; "—" when unknown. */
+export function formatRate(bytesPerSec: number | null | undefined): string {
+  if (bytesPerSec == null || !Number.isFinite(bytesPerSec)) return DASH;
+  return `${formatBytes(bytesPerSec)}/s`;
+}
+
 const compactNumber = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 });
 
 /** Compact counts: 1_234_567 → "1.2M". */

@@ -1,7 +1,8 @@
 // Dev-only mock of the game-cacher REST API, mounted as Vite dev-server
 // middleware by `npm run dev:mock` (see vite.config.ts). In-memory and
 // stateful: stats grow, platforms toggle, QR / guard / auth-code sign-in flows
-// work, update runs complete after a few seconds. Never part of the production bundle.
+// work, update runs go through listing → checking → downloading with live
+// progress and can be cancelled. Never part of the production bundle.
 //
 // Set MOCK_AUTH=1 to require the admin password "admin" (exercises /login).
 
@@ -13,9 +14,9 @@ import type {
   LoginMethod,
   LoginRequest,
   LoginResponse,
+  GameRun,
   ManagedStatus,
   PlatformSummary,
-  UpdateReport,
   UpdateRun,
   UpdateSchedule,
 } from "../src/api/types";
@@ -23,7 +24,6 @@ import { MIN_GAP_MINUTES, TIME_RE, normalizeTimes, tooClose } from "../src/lib/s
 
 const GB = 1e9;
 const MB = 1e6;
-const nowIso = () => new Date().toISOString();
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 class HttpError extends Error {
@@ -49,13 +49,29 @@ type Managed = {
   loggedIn: boolean;
   account: string | null;
   selected: string[];
-  runningUntil: number;
-  lastRun: UpdateRun | null;
+  active: ActiveRun | null;
+  /** Finished runs, newest first. */
+  history: UpdateRun[];
   nextRun: number | null;
   games: Omit<Game, "selected">[];
 };
 
 type Platform = PlatformSummary & { managedState?: Managed };
+
+/** What a simulated run will do per game, fixed when it starts. */
+type GamePlanSim = {
+  id: string;
+  name: string;
+  previous: string | null;
+  current: string | null;
+  failed: boolean;
+  toDownload: number;
+  cached: number;
+  objects: number;
+  downloadMs: number;
+};
+
+type ActiveRun = { id: string; startedAt: number; cancelledAt: number | null; plans: GamePlanSim[] };
 
 function games(prefix: string, names: [string, number][]): Omit<Game, "selected">[] {
   return names.map(([name, size], i) => ({
@@ -103,8 +119,8 @@ function managed(methods: LoginMethod[], over: Partial<Managed> & { gameList?: M
     loggedIn: false,
     account: null,
     selected: [],
-    runningUntil: 0,
-    lastRun: null,
+    active: null,
+    history: [],
     nextRun: Date.now() + 40 * 60_000,
     games: over.gameList ?? [],
     ...over,
@@ -182,6 +198,23 @@ const platforms: Platform[] = [
 ];
 platforms[4].enabled = false;
 
+/** Past runs for the history page: two finished Blizzard runs and an interrupted one. */
+function seedHistory() {
+  const { m } = findManaged("blizzard");
+  const past = (hoursAgo: number, games: string[], incomplete = false): UpdateRun => {
+    const a = startRun({ ...m, selected: games });
+    a.startedAt = Date.now() - hoursAgo * 3600_000;
+    const run = simulate("blizzard", a, a.startedAt + (incomplete ? 4000 : 3600_000));
+    if (!incomplete) return run;
+    const stopped = run.games.map((g): GameRun =>
+      g.status === "done" || g.status === "failed" ? g : { ...g, status: "cancelled", rate_bps: null, eta_secs: null },
+    );
+    return { ...run, games: stopped, status: "incomplete", phase: null, rate_bps: null, eta_secs: null };
+  };
+  const ids = m.games.map((g) => g.id);
+  m.history = [past(3, ids.slice(0, 2), true), past(14, ids.slice(0, 5)), past(38, ids.slice(0, 2))];
+}
+
 /** qr/device challenges: poll count until they succeed. */
 const challenges = new Map<string, { platform: string; polls: number; kind: "qr" | "device"; account: string }>();
 let challengeSeq = 0;
@@ -241,30 +274,166 @@ function nextTrigger(): number | null {
   return future.length ? Math.min(...future) : null;
 }
 
-/** Finishes a run whose timer elapsed, producing a plausible report. */
-function settleRun(m: Managed, p: Platform) {
-  if (m.runningUntil === 0 || Date.now() < m.runningUntil) return;
-  m.runningUntil = 0;
-  m.nextRun = nextTrigger();
-  const started = new Date(Date.now() - 6000).toISOString();
-  const reports: UpdateReport[] = m.selected.map((sel, i) => {
+// ── Simulated update runs ──────────────────────────────────────────────
+
+const LIST_MS = 600;
+const CHECK_MS = 900;
+/** Simulated download speed. */
+const RATE = 400 * MB;
+const KEEP_RUNS = 10;
+let runSeq = 0;
+
+function startRun(m: Managed): ActiveRun {
+  const plans = m.selected.map((sel, i): GamePlanSim => {
     const g = m.games.find((x) => x.id === sel);
+    const size = g?.size_bytes ?? 2 * GB;
     const updated = i % 2 === 0;
-    const failed = i === 3;
+    const toDownload = updated ? Math.round(size * 0.12) : 0;
     return {
-      game_id: sel,
-      name: g?.name ?? sel,
-      previous_version: g?.version ?? null,
-      current_version: updated ? `build-${6000 + i}` : (g?.version ?? null),
-      updated,
-      bytes_downloaded: updated ? Math.round((g?.size_bytes ?? 2 * GB) * 0.12) : 0,
-      bytes_already_cached: failed ? 0 : Math.round((g?.size_bytes ?? 2 * GB) * 0.88),
-      files: 20 + i * 7,
-      error: failed ? "upstream timed out (504)" : null,
+      id: sel,
+      name: g?.name ?? sel.split("/").pop() ?? sel,
+      previous: g?.version ?? null,
+      current: updated ? `build-${6000 + i}` : (g?.version ?? null),
+      failed: i === 3,
+      toDownload,
+      cached: size - toDownload,
+      objects: Math.max(1, Math.round(size / MB)),
+      downloadMs: Math.min(20_000, Math.max(1500, (toDownload / RATE) * 1000)),
     };
   });
-  m.lastRun = { started, finished: nowIso(), games: reports };
-  p.stats.storage_bytes += reports.reduce((a, r) => a + r.bytes_downloaded, 0);
+  return { id: `mock-${++runSeq}`, startedAt: Date.now(), cancelledAt: null, plans };
+}
+
+function gameRun(plan: GamePlanSim, over: Partial<GameRun>): GameRun {
+  return {
+    game_id: plan.id,
+    name: plan.name,
+    previous_version: null,
+    current_version: null,
+    updated: false,
+    bytes_downloaded: 0,
+    bytes_already_cached: 0,
+    files: 0,
+    error: null,
+    status: "pending",
+    bytes_to_download: null,
+    objects: 0,
+    objects_done: 0,
+    rate_bps: null,
+    eta_secs: null,
+    ...over,
+  };
+}
+
+/** The run's record at `now`, derived from its plans (deterministic). */
+function simulate(platformId: string, a: ActiveRun, now: number): UpdateRun {
+  const t = Math.min(now, a.cancelledAt ?? Infinity) - a.startedAt;
+  const run: UpdateRun = {
+    id: a.id,
+    platform: platformId,
+    started: new Date(a.startedAt).toISOString(),
+    finished: null,
+    status: "running",
+    phase: "listing",
+    bytes_to_download: 0,
+    bytes_downloaded: 0,
+    rate_bps: null,
+    eta_secs: null,
+    games: [],
+  };
+  if (t < LIST_MS) return finishIfCancelled(run, a);
+  run.phase = "checking";
+  let clock = LIST_MS;
+  const checked = (p: GamePlanSim) =>
+    gameRun(p, {
+      status: "queued",
+      previous_version: p.previous,
+      current_version: p.current,
+      bytes_to_download: p.toDownload,
+      objects: p.objects,
+    });
+  run.games = a.plans.map((p) => {
+    const g = t < clock ? gameRun(p, {}) : t < clock + CHECK_MS ? gameRun(p, { status: "checking" }) : checked(p);
+    clock += CHECK_MS;
+    return g;
+  });
+  if (t >= clock) {
+    run.phase = "downloading";
+    run.games = a.plans.map((p, i) => {
+      const [start, end] = [clock, clock + p.downloadMs];
+      clock = end;
+      if (t < start) return run.games[i];
+      if (t >= end) return finishedGame(p);
+      const frac = (t - start) / p.downloadMs;
+      const rate = Math.round(p.toDownload / (p.downloadMs / 1000));
+      return gameRun(p, {
+        ...checked(p),
+        status: "downloading",
+        bytes_downloaded: Math.round(p.toDownload * frac),
+        bytes_already_cached: Math.round(p.cached * frac),
+        objects_done: Math.round(p.objects * frac),
+        rate_bps: rate,
+        eta_secs: Math.ceil((end - t) / 1000),
+      });
+    });
+    if (t >= clock) {
+      run.status = run.games.some((g) => g.status === "failed") ? "error" : "ok";
+      run.phase = null;
+      run.finished = new Date(a.startedAt + clock).toISOString();
+    }
+  }
+  run.bytes_to_download = run.games.reduce((s, g) => s + (g.bytes_to_download ?? 0), 0);
+  run.bytes_downloaded = run.games.reduce((s, g) => s + g.bytes_downloaded, 0);
+  const current = run.games.find((g) => g.status === "downloading");
+  if (current) {
+    run.rate_bps = current.rate_bps;
+    const remaining = run.games
+      .filter((g) => g.status === "queued" || g.status === "downloading")
+      .reduce((s, g) => s + Math.max(0, (g.bytes_to_download ?? 0) - g.bytes_downloaded), 0);
+    run.eta_secs = current.rate_bps ? Math.ceil(remaining / current.rate_bps) : null;
+  }
+  return finishIfCancelled(run, a);
+}
+
+function finishedGame(p: GamePlanSim): GameRun {
+  return gameRun(p, {
+    status: p.failed ? "failed" : "done",
+    previous_version: p.previous,
+    current_version: p.current,
+    updated: p.toDownload > 0 || p.previous !== p.current,
+    bytes_downloaded: p.failed ? Math.round(p.toDownload / 2) : p.toDownload,
+    bytes_already_cached: p.cached,
+    files: p.failed ? p.objects - 3 : p.objects,
+    error: p.failed ? "depot 1002: 3 of 2100 objects failed: upstream timed out (504)" : null,
+    bytes_to_download: p.toDownload,
+    objects: p.objects,
+    objects_done: p.objects,
+  });
+}
+
+function finishIfCancelled(run: UpdateRun, a: ActiveRun): UpdateRun {
+  if (a.cancelledAt === null || run.status !== "running") return run;
+  run.games = run.games.map((g) =>
+    g.status === "done" || g.status === "failed" ? g : { ...g, status: "cancelled", rate_bps: null, eta_secs: null },
+  );
+  if (run.games.length === 0) run.games = a.plans.map((p) => gameRun(p, { status: "cancelled" }));
+  return { ...run, status: "cancelled", phase: null, rate_bps: null, eta_secs: null, finished: new Date(a.cancelledAt).toISOString() };
+}
+
+/** Moves a run that has finished into the history. */
+function settleRun(m: Managed, p: Platform) {
+  if (!m.active) return;
+  const run = simulate(p.id, m.active, Date.now());
+  if (run.status === "running") return;
+  m.active = null;
+  m.history = [run, ...m.history].slice(0, KEEP_RUNS);
+  m.nextRun = nextTrigger();
+  p.stats.storage_bytes += run.bytes_downloaded;
+}
+
+function runs(p: Platform, m: Managed): UpdateRun[] {
+  settleRun(m, p);
+  return m.active ? [simulate(p.id, m.active, Date.now()), ...m.history] : m.history;
 }
 
 function managedStatus(p: Platform, m: Managed): ManagedStatus {
@@ -273,8 +442,8 @@ function managedStatus(p: Platform, m: Managed): ManagedStatus {
     auth: { logged_in: m.loggedIn, account: m.account, required: m.required, auth_url: m.authUrl ?? null },
     login_methods: m.methods,
     selected: m.selected,
-    running: m.runningUntil > Date.now(),
-    last_run: m.lastRun,
+    running: m.active !== null,
+    last_run: runs(p, m)[0] ?? null,
     next_run: m.nextRun === null ? null : new Date(m.nextRun).toISOString(),
   };
 }
@@ -380,6 +549,10 @@ async function route(method: string, path: string, body: unknown): Promise<Handl
     if (method === "PUT") updateSchedule = parseSchedule(body);
     return { body: { update_schedule: updateSchedule } };
   }
+  if (path === "/api/runs") {
+    const all = platforms.flatMap((p) => (p.managedState ? runs(p, p.managedState) : []));
+    return { body: all.sort((a, b) => Date.parse(b.started) - Date.parse(a.started)) };
+  }
   if (path === "/api/platforms") {
     for (const p of platforms) if (p.enabled) tick(p);
     return { body: platforms.map(summary) };
@@ -431,9 +604,17 @@ function managedRoute(method: string, rest: string, p: Platform, body: unknown):
       return { body: managedStatus(p, m) };
     }
     case "POST managed/run": {
-      if (m.runningUntil > Date.now()) throw new HttpError(409, "an update run is already in progress");
-      m.runningUntil = Date.now() + 6000;
+      settleRun(m, p);
+      if (m.active) throw new HttpError(409, "an update run is already in progress");
+      if (!p.enabled) throw new HttpError(409, `${p.id} is disabled`);
+      m.active = startRun(m);
       return { status: 202, body: { started: true } };
+    }
+    case "POST managed/run/cancel": {
+      settleRun(m, p);
+      if (!m.active || m.active.cancelledAt !== null) throw new HttpError(409, "no update run is in progress");
+      m.active.cancelledAt = Date.now();
+      return { status: 202, body: { cancelling: true } };
     }
     default:
       throw new HttpError(404, `no route for ${method} /api/platforms/${p.id}/${rest}`);
@@ -511,3 +692,6 @@ export function mockApi(): Plugin {
     },
   };
 }
+
+// Last: seeding uses the run simulation's constants declared above.
+seedHistory();

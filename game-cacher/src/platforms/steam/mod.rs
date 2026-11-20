@@ -25,6 +25,7 @@ use tokio::sync::Mutex;
 
 use self::auth::{LoginFlow, Step};
 use self::backend::{SteamBackend, SteamSession};
+use super::plan::{GamePlan, Outcome};
 use super::{
     AuthStatus, Game, LoginMethod, LoginRequest, LoginResponse, ManagedUpdates, Platform,
     PlatformCtx, UpdateReport, domains,
@@ -207,7 +208,7 @@ impl SteamManaged {
         Ok(games)
     }
 
-    async fn update(&self, ctx: &PlatformCtx, game_id: &str) -> Result<UpdateReport> {
+    async fn plan(&self, ctx: &PlatformCtx, game_id: &str) -> Result<GamePlan> {
         let app_id: u32 = game_id
             .parse()
             .with_context(|| format!("invalid Steam app id {game_id:?}"))?;
@@ -216,23 +217,15 @@ impl SteamManaged {
             .apps
             .remove(game_id)
             .unwrap_or_default();
-        let (report, next) = loop {
+        loop {
             let (session, reused) = self.session(ctx).await?;
-            match update::update_app(session.as_ref(), ctx.prefill.as_ref(), app_id, &previous)
-                .await
+            match update::plan_app(session.as_ref(), ctx.prefill.as_ref(), app_id, &previous).await
             {
-                Ok(r) => break r,
+                Ok(plan) => return Ok(plan),
                 Err(e) if self.should_retry(reused, &e).await => continue,
                 Err(e) => return Err(e),
             }
-        };
-        if next != previous {
-            self.update_state(ctx, |s| {
-                s.apps.insert(game_id.to_string(), next);
-            })
-            .await?;
         }
-        Ok(report)
     }
 }
 
@@ -291,14 +284,23 @@ impl ManagedUpdates for SteamManaged {
         }
     }
 
-    async fn update_game(&self, ctx: &PlatformCtx, game_id: &str) -> Result<UpdateReport> {
-        Ok(match self.update(ctx, game_id).await {
-            Ok(report) => report,
-            Err(e) => UpdateReport {
-                game_id: game_id.to_string(),
-                error: Some(format!("{e:#}")),
-                ..Default::default()
-            },
+    async fn plan_game(&self, ctx: &PlatformCtx, game_id: &str) -> Result<GamePlan> {
+        self.plan(ctx, game_id).await
+    }
+
+    async fn commit(
+        &self,
+        ctx: &PlatformCtx,
+        plan: &GamePlan,
+        outcome: &Outcome,
+        _report: &mut UpdateReport,
+    ) -> Result<()> {
+        let Some(next) = update::next_state(plan, outcome) else {
+            return Ok(());
+        };
+        self.update_state(ctx, |s| {
+            s.apps.insert(plan.game_id.clone(), next);
         })
+        .await
     }
 }

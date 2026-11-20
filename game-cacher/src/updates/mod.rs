@@ -1,28 +1,29 @@
 //! Managed-update scheduler and run tracking. Each managed platform's selected
-//! games are updated at the times in `update_schedule` (see `schedule`); run
-//! history is kept in `state/<platform>.runs.json`.
+//! games are updated at the times in `update_schedule` (see `schedule`). A run
+//! lists the games, checks what each needs, then downloads them one by one
+//! (`runner`); live progress is kept in memory (`progress`) and the last runs
+//! in `state/<platform>.runs.json` (`history`).
 
-use std::collections::HashSet;
+mod history;
+pub mod model;
+mod progress;
+mod runner;
+
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
+use self::history::History;
+pub use self::model::{GameRun, GameStatus, Phase, RunStatus, UpdateRun};
+use self::progress::ActiveRun;
 use crate::metrics::Metrics;
-use crate::platforms::{
-    AuthStatus, DynPlatform, LoginMethod, PlatformCtx, Platforms, Prefill, UpdateReport,
-};
+use crate::platforms::{AuthStatus, DynPlatform, LoginMethod, PlatformCtx, Platforms, Prefill};
 use crate::secrets::DynSecrets;
 use crate::settings::SettingsStore;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UpdateRun {
-    pub started: DateTime<Utc>,
-    pub finished: Option<DateTime<Utc>>,
-    pub games: Vec<UpdateReport>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ManagedStatus {
@@ -30,6 +31,7 @@ pub struct ManagedStatus {
     pub login_methods: Vec<LoginMethod>,
     pub selected: Vec<String>,
     pub running: bool,
+    /// The latest run (live while running).
     pub last_run: Option<UpdateRun>,
     pub next_run: Option<DateTime<Utc>>,
 }
@@ -38,6 +40,10 @@ pub struct ManagedStatus {
 #[error("an update run is already in progress")]
 pub struct AlreadyRunning;
 
+#[derive(Debug, thiserror::Error)]
+#[error("no update run is in progress")]
+pub struct NotRunning;
+
 pub struct UpdateManager {
     platforms: Arc<Platforms>,
     settings: Arc<SettingsStore>,
@@ -45,7 +51,10 @@ pub struct UpdateManager {
     http: reqwest::Client,
     prefill: Arc<dyn Prefill>,
     metrics: Arc<Metrics>,
-    running: Mutex<HashSet<String>>,
+    history: History,
+    /// Active run per platform id.
+    active: Mutex<HashMap<String, Arc<ActiveRun>>>,
+    snapshot_every: Duration,
 }
 
 impl UpdateManager {
@@ -59,12 +68,14 @@ impl UpdateManager {
     ) -> Arc<Self> {
         Arc::new(Self {
             platforms,
+            history: History::new(settings.clone()),
             settings,
             secrets,
             http,
             prefill,
             metrics,
-            running: Mutex::new(HashSet::new()),
+            active: Mutex::new(HashMap::new()),
+            snapshot_every: runner::SNAPSHOT_EVERY,
         })
     }
 
@@ -78,19 +89,69 @@ impl UpdateManager {
         }
     }
 
+    fn active_map(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<ActiveRun>>> {
+        self.active.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn active_run(&self, platform_id: &str) -> Option<Arc<ActiveRun>> {
+        self.active_map().get(platform_id).cloned()
+    }
+
+    fn is_active(&self, run: &Arc<ActiveRun>) -> bool {
+        self.active_map().values().any(|a| Arc::ptr_eq(a, run))
+    }
+
     pub fn is_running(&self, platform_id: &str) -> bool {
-        self.running
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(platform_id)
+        self.active_map().contains_key(platform_id)
+    }
+
+    async fn save_snapshot(&self, active: &ActiveRun) {
+        let run = active.view(Instant::now());
+        if let Err(e) = self.history.save(&run).await {
+            log::warn!("saving {} run record: {e:#}", run.platform);
+        }
+    }
+
+    /// A platform's runs, newest first: the active one live, stored ones as saved,
+    /// except a stored `running` run that isn't active (its process died), which
+    /// is shown as incomplete.
+    pub async fn runs(&self, platform_id: &str) -> Result<Vec<UpdateRun>> {
+        let mut runs = self.history.load(platform_id).await?;
+        for r in runs.iter_mut().filter(|r| r.status == RunStatus::Running) {
+            r.mark_incomplete();
+        }
+        if let Some(active) = self.active_run(platform_id) {
+            let live = active.view(Instant::now());
+            runs.retain(|r| r.id != live.id);
+            runs.insert(0, live);
+        }
+        Ok(runs)
+    }
+
+    /// Runs of every managed platform, newest first.
+    pub async fn all_runs(&self) -> Result<Vec<UpdateRun>> {
+        let mut all = Vec::new();
+        for p in self
+            .platforms
+            .all()
+            .iter()
+            .filter(|p| p.managed().is_some())
+        {
+            all.extend(self.runs(p.id()).await?);
+        }
+        all.sort_by_key(|r| std::cmp::Reverse(r.started));
+        Ok(all)
     }
 
     pub async fn last_run(&self, platform_id: &str) -> Result<Option<UpdateRun>> {
-        let v = self.runs_store(platform_id).load().await?;
-        Ok(serde_json::from_value::<Option<UpdateRun>>(
-            v.get("last_run").cloned().unwrap_or_default(),
-        )
-        .unwrap_or_default())
+        Ok(self.runs(platform_id).await?.into_iter().next())
+    }
+
+    /// The schedule's reference point: when the last run started, or None
+    /// (run as soon as the schedule allows) when it was left incomplete.
+    fn schedule_anchor(last: Option<&UpdateRun>) -> Option<DateTime<Utc>> {
+        last.filter(|r| r.status != RunStatus::Incomplete)
+            .map(|r| r.started)
     }
 
     pub async fn status(&self, platform: &DynPlatform) -> Result<ManagedStatus> {
@@ -110,7 +171,7 @@ impl UpdateManager {
         } else {
             settings
                 .update_schedule
-                .next_run(last_run.as_ref().map(|r| r.started), Utc::now())
+                .next_run(Self::schedule_anchor(last_run.as_ref()), Utc::now())
         };
         Ok(ManagedStatus {
             auth,
@@ -125,77 +186,30 @@ impl UpdateManager {
     /// Starts a run in the background. Errors with `AlreadyRunning` if one is active.
     pub fn run_now(self: &Arc<Self>, platform: DynPlatform) -> Result<()> {
         let id = platform.id().to_string();
-        if !self
-            .running
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id.clone())
+        let active = Arc::new(ActiveRun::new(UpdateRun::new(&id)));
         {
-            return Err(AlreadyRunning.into());
+            let mut map = self.active_map();
+            if map.contains_key(&id) {
+                return Err(AlreadyRunning.into());
+            }
+            map.insert(id.clone(), active.clone());
         }
+        runner::spawn_snapshots(self.clone(), active.clone(), self.snapshot_every);
         let this = self.clone();
         tokio::spawn(async move {
-            // Clears the running flag even if the run panics.
-            let _guard = RunningGuard(this.clone(), id.clone());
-            if let Err(e) = this.run(&platform).await {
-                log::error!("managed update run for {id} failed: {e:#}");
-            }
+            // Unregisters the run even if it panics.
+            let _guard = RunningGuard(this.clone(), id);
+            runner::run(&this, &platform, &active).await;
         });
         Ok(())
     }
 
-    async fn run(&self, platform: &DynPlatform) -> Result<()> {
-        let Some(managed) = platform.managed() else {
-            return Ok(());
-        };
-        let id = platform.id();
-        let ctx = self.ctx(id);
-        let selected = self.settings.get().await.selected(id);
-        log::info!("managed update run for {id}: {} game(s)", selected.len());
-        let mut run = UpdateRun {
-            started: Utc::now(),
-            finished: None,
-            games: vec![],
-        };
-        self.save_run(id, &run).await?;
-        let mut ok = true;
-        for game_id in selected {
-            let report = match managed.update_game(&ctx, &game_id).await {
-                Ok(r) => r,
-                Err(e) => UpdateReport {
-                    game_id: game_id.clone(),
-                    name: game_id.clone(),
-                    error: Some(format!("{e:#}")),
-                    ..Default::default()
-                },
-            };
-            ok &= report.error.is_none();
-            self.metrics.update_bytes(id, report.bytes_downloaded);
-            log::info!(
-                "{id}/{}: updated={} downloaded={} cached={} error={:?}",
-                report.game_id,
-                report.updated,
-                report.bytes_downloaded,
-                report.bytes_already_cached,
-                report.error
-            );
-            run.games.push(report);
-            self.save_run(id, &run).await?;
-        }
-        run.finished = Some(Utc::now());
-        self.save_run(id, &run).await?;
-        self.metrics.update_run(id, ok);
+    /// Asks the platform's active run to stop. Errors with `NotRunning` if none is.
+    pub fn cancel(&self, platform_id: &str) -> Result<()> {
+        let active = self.active_run(platform_id).ok_or(NotRunning)?;
+        log::info!("cancelling managed update run for {platform_id}");
+        active.cancel.cancel();
         Ok(())
-    }
-
-    fn runs_store(&self, platform_id: &str) -> Arc<dyn crate::platforms::StateStore> {
-        self.settings.state_store(&format!("{platform_id}.runs"))
-    }
-
-    async fn save_run(&self, platform_id: &str, run: &UpdateRun) -> Result<()> {
-        self.runs_store(platform_id)
-            .save(&serde_json::json!({ "last_run": run }))
-            .await
     }
 
     /// Starts runs for platforms that are due. Called every minute by `spawn_scheduler`.
@@ -221,7 +235,7 @@ impl UpdateManager {
             };
             if !settings
                 .update_schedule
-                .is_due(last.map(|r| r.started), Utc::now())
+                .is_due(Self::schedule_anchor(last.as_ref()), Utc::now())
             {
                 continue;
             }
@@ -256,10 +270,6 @@ struct RunningGuard(Arc<UpdateManager>, String);
 
 impl Drop for RunningGuard {
     fn drop(&mut self) {
-        self.0
-            .running
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.1);
+        self.0.active_map().remove(&self.1);
     }
 }

@@ -2,6 +2,7 @@ import { useCallback } from "react";
 import { Link } from "react-router";
 import { getStatus, listPlatforms } from "@/api/client";
 import type { AppStatus, PlatformSummary } from "@/api/types";
+import { ActiveRuns } from "@/components/runs/active-runs";
 import { KeyValue, Stat } from "@/components/stat";
 import { AlertBanner } from "@/components/ui/alert-banner";
 import { Badge } from "@/components/ui/badge";
@@ -37,6 +38,7 @@ export default function Dashboard() {
       {error && <AlertBanner variant="error" message={error.message} onRetry={refresh} className="mb-4" />}
 
       <Totals platforms={platforms.data} />
+      <ActiveRuns platforms={platforms.data} />
       <div className="grid gap-6 lg:grid-cols-2 mt-6">
         <StorageCard status={status.data} />
         <ServicesCard status={status.data} />

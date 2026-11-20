@@ -59,16 +59,44 @@ export type UpdateReport = {
   previous_version: string | null;
   current_version: string | null;
   updated: boolean;
+  /** Grows live while the game downloads. */
   bytes_downloaded: number;
   bytes_already_cached: number;
   files: number;
   error: string | null;
 };
 
+export type RunStatus = "running" | "ok" | "error" | "cancelled" | "incomplete";
+
+export type RunPhase = "listing" | "checking" | "downloading";
+
+export type GameStatus = "pending" | "checking" | "queued" | "downloading" | "done" | "failed" | "cancelled";
+
+export type GameRun = UpdateReport & {
+  status: GameStatus;
+  /** Estimate, once checked. */
+  bytes_to_download: number | null;
+  objects: number;
+  objects_done: number;
+  /** Live, while downloading. */
+  rate_bps: number | null;
+  eta_secs: number | null;
+};
+
 export type UpdateRun = {
+  id: string;
+  platform: string;
   started: string;
   finished: string | null;
-  games: UpdateReport[];
+  status: RunStatus;
+  phase: RunPhase | null;
+  /** Sums over games. */
+  bytes_to_download: number;
+  bytes_downloaded: number;
+  /** Live, while downloading. */
+  rate_bps: number | null;
+  eta_secs: number | null;
+  games: GameRun[];
 };
 
 export type ManagedStatus = {
@@ -76,6 +104,7 @@ export type ManagedStatus = {
   login_methods: LoginMethod[];
   selected: string[];
   running: boolean;
+  /** The latest run (live while running). */
   last_run: UpdateRun | null;
   next_run: string | null;
 };
