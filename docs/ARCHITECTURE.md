@@ -181,6 +181,13 @@ Trait `Platform` (`platforms/mod.rs`): `id`, `name`, `description`, `domains`,
 `matches_user_agent`, `cache_policy`, `hide_etag`, `managed() -> Option<&dyn ManagedUpdates>`.
 Domain lists come from uklans/cache-domains (`platforms/domains.rs`).
 
+Epic clients: the Epic Games Launcher (20.x) and its Epic Online Services
+helper download over HTTPS, which only reaches the SNI passthrough and is never
+cached. There is no fallback to HTTP when 443 fails; the launcher switches to
+`http://` only when `[Launcher] UseHttpForDownloads=True` is set in the per-user
+`%LOCALAPPDATA%\EpicGamesLauncher\Saved\Config\WindowsEditor\GameUserSettings.ini`.
+The Epic platform page shows these client setup steps.
+
 `ManagedUpdates`: `login_methods`, `auth_status`, `login(step)`, `logout`,
 `list_games`, `game_name(game_id)` (display name before planning, no network),
 `plan_game(game_id) -> GamePlan`, `commit(plan, outcome, report)`, `validate_selection`

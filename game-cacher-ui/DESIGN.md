@@ -62,7 +62,7 @@ Polls `/api/status` and `/api/platforms` every 5 s. Totals row (requests, hit ra
 Table: name (link) + description, enabled badge, enable/disable `Switch` (`PUT /api/platforms/{id}`), "managed updates" badge, storage.
 
 ### Platform detail `/platforms/:id`
-Header with enabled badge, managed badge and "Purge cache" (confirm dialog; toast reports freed bytes). Stat tiles, domains card. If `managed`, the Managed updates section:
+Header with enabled badge, managed badge and "Purge cache" (confirm dialog; toast reports freed bytes). Stat tiles, domains card. Epic only: a static "Client setup" card (`components/platforms/epic-client-setup.tsx`) with numbered steps to set `[Launcher] UseHttpForDownloads=True` in the client's `GameUserSettings.ini`, path and snippet in copyable code blocks. If `managed`, the Managed updates section:
 - **Sign-in** card by `login_methods`: `qr` shows "Sign in with QR" → QR code of the returned `url` + 2 s `qr_poll`; `password` shows username/password, then a guard code field (`email` code, or `device` authenticator code; if the submit answers `pending`, a "waiting for Steam" state polls `qr_poll` until `logged_in` / `failed`) or "approve on your phone" with `qr_poll` polling (`device_confirmation`); `auth_code` links to `auth.auth_url` and takes the code (raw, or pasted `{"authorizationCode": "..."}`); `none` says "No sign-in required". Signed in: account + Sign out.
 - **Update URLs** (`manual_list`, Windows Update): textarea, one URL per line, saved as the selection.
 - **Games** (shown when signed in or auth not required): checkbox, name, id, version, size; filter box; Save selection (enabled only with unsaved changes).
