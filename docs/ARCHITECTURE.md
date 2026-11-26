@@ -91,7 +91,7 @@ docker/Dockerfile          multi-stage UBI10 image
 settings.json                              SettingsStore (UI-editable settings)
 state/<platform>.json                      managed-update state per platform (owned by the platform)
 state/<platform>.runs.json                 last 10 managed-update runs (UpdateManager)
-index/lru.json                             LRU index snapshot (object → size, last_access)
+index/lru.json                             LRU index snapshot (object → stored bytes, full size, last_access)
 secrets/<name>.enc                         storage-backed secrets (ChaCha20-Poly1305, key from GC_SECRETS_KEY)
 cache/<identifier>/<h[0..2]>/<h[2..4]>/<h>/meta.json   object metadata
 cache/<identifier>/<h[0..2]>/<h[2..4]>/<h>/<slice>     slice bodies (decimal slice index)
@@ -170,7 +170,13 @@ is ignored with a startup warning (dropped on the next save).
     whole objects oldest-first down to 90% of max. The index also keeps an
     in-memory bitset of stored slices per object (rebuilt from listings and
     reads); `Prefill::warm` skips per-slice storage checks only when every
-    slice bit is set. Entries are kept compact (platform number + 32-byte
+    slice bit is set. It also records each object's full size (`total`, from
+    its meta.json when written or read back) and persists it in the snapshot
+    (omitted while unknown, e.g. after a rebuild from listings), so "stored
+    slice bytes == total" tells from memory, across restarts, that an object is
+    complete: `Prefill::touch_if_cached` and `Prefill::warm` check that before
+    reading any metadata. More bytes than the size means the entry is off and
+    is not trusted. Entries are kept compact (platform number + 32-byte
     object hash, inline first bitset word) since a large cache holds millions;
     the snapshot is serialized straight from the map and read entry by entry,
     never copying the whole index.
@@ -195,10 +201,10 @@ The Epic platform page shows these client setup steps.
 `update_game` (plan → warm → commit, no progress) is a provided method used by tests.
 Platforms fetch content through the `Prefill` handle, which runs the request through
 the cache engine in-process (with the platform identifier), so later LAN clients hit.
-Every run re-enumerates the selected games' content and warms it, which
-verifies it against the cache: unchanged content costs only in-memory index
-lookups, and anything evicted or purged is downloaded again (`updated: true`
-with `bytes_downloaded > 0`). Prefill and runs are refused for disabled platforms.
+Every run re-enumerates the selected games' content and checks it against the
+cache: objects the index holds in full are counted as already cached and
+skipped (in-memory lookups, no storage I/O), the rest are warmed, so anything
+evicted or purged is downloaded again (`updated: true` with `bytes_downloaded > 0`). Prefill and runs are refused for disabled platforms.
 
 `GamePlan` (`platforms/plan.rs`): version check result (`previous_version`,
 `current_version`, `version_changed`), one CDN `host`, the objects to warm
@@ -212,7 +218,9 @@ per depot; others: all-or-nothing), so failures are retried next run.
 
 `Prefill` also offers `warm_observed` (per-slice download callback, for live
 progress), `cached_bytes` (slice bytes the in-memory LRU index holds for an object,
-no I/O) and `object_size` (stored meta, else probe upstream for slice 0, which is cached).
+no I/O), `touch_if_cached` (the object's full size when the index holds all of it,
+marking it used; no I/O) and `object_size` (stored meta, else probe upstream for
+slice 0, which is cached).
 
 ### Update runs (`updates/`)
 
@@ -221,14 +229,17 @@ A run (one per platform at a time) goes through three phases, recorded in its
 
 1. **listing**: every selected game is recorded as `pending`.
 2. **checking**: each game is planned (`checking` → `queued`, or `failed` when the
-   plan errors) and its download estimated: per object, the listed size minus
-   `cached_bytes`; objects without a listed size (Windows Update URLs, Blizzard
+   plan errors) and its download estimated. Objects the index holds in full
+   (`touch_if_cached`) are marked cached and marked used, so eviction keeps the
+   selected games: their bytes go to the game's `bytes_already_cached` and they
+   count towards `objects_done` right away. Other objects count their listed
+   size minus `cached_bytes`; objects without a listed size (Windows Update URLs, Blizzard
    non-archive indexes, loose files when the encoding file lacks sizes) are sized
    with `object_size`. Bytes fetched by such probes count as downloaded.
    Blizzard archive sizes come from their indexes (end of the last blob); loose file
    sizes from the encoding file's EKey-spec pages.
-3. **downloading**: queued games are warmed one at a time (`downloading` → `done` /
-   `failed` / `cancelled`) and committed. Rates are averaged over a sliding 20 s
+3. **downloading**: queued games are warmed one at a time, skipping the objects
+   found cached (`downloading` → `done` / `failed` / `cancelled`), and committed. Rates are averaged over a sliding 20 s
    window; ETA = estimated remaining bytes / rate, per game and for the run.
 
 Plans are kept in memory between checking and downloading (~100 B per object).
@@ -328,7 +339,8 @@ GameRun = UpdateReport + { status: "pending" | "checking" | "queued" | "download
   objects, objects_done, rate_bps: u64 | null, eta_secs: u64 | null }
 UpdateReport = { game_id, name, previous_version, current_version, updated: bool,
   bytes_downloaded, bytes_already_cached, files, error: str | null }
-  (bytes_downloaded grows live while the game downloads)
+  (bytes_downloaded grows live while the game downloads; bytes_already_cached
+  and objects_done include the objects found cached when the game was checked)
 ```
 
 ## Metrics (OpenMetrics, prefix `gamecacher_`)

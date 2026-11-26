@@ -2,7 +2,7 @@
 //! on MemoryStorage, and reqwest clients sending explicit Host headers.
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
@@ -15,7 +15,7 @@ use game_cacher::cache::{CacheEngine, EngineDeps, LruIndex, STATUS_HEADER};
 use game_cacher::metrics::Metrics;
 use game_cacher::platforms::{self, Platforms, Prefill};
 use game_cacher::settings::{PlatformSettings, SettingsStore};
-use game_cacher::storage::{DynStorage, MemoryStorage};
+use game_cacher::storage::{DynStorage, MemoryStorage, ObjectInfo, Storage};
 use game_cacher::upstream::{HostResolver, LoopGuard, StaticResolver, Upstream};
 use http::StatusCode;
 use http::header::{CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, ETAG, LOCATION, RANGE};
@@ -173,6 +173,47 @@ struct Opts {
     resolver: Option<Arc<dyn HostResolver>>,
     dead_upstream: bool,
     read_ahead: Option<usize>,
+    /// Existing storage (e.g. a previous harness's, as after a restart).
+    storage: Option<DynStorage>,
+}
+
+/// MemoryStorage that counts meta.json reads and can fail existence checks.
+#[derive(Default)]
+struct Probed {
+    inner: MemoryStorage,
+    meta_gets: AtomicU64,
+    fail_exists: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl Storage for Probed {
+    fn name(&self) -> &'static str {
+        "probed"
+    }
+    async fn get(&self, key: &str) -> anyhow::Result<Option<Bytes>> {
+        if key.ends_with("/meta.json") {
+            self.meta_gets.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.get(key).await
+    }
+    async fn put(&self, key: &str, data: Bytes) -> anyhow::Result<()> {
+        self.inner.put(key, data).await
+    }
+    async fn delete(&self, key: &str) -> anyhow::Result<()> {
+        self.inner.delete(key).await
+    }
+    async fn delete_prefix(&self, prefix: &str) -> anyhow::Result<(u64, u64)> {
+        self.inner.delete_prefix(prefix).await
+    }
+    async fn list(&self, prefix: &str) -> anyhow::Result<Vec<ObjectInfo>> {
+        self.inner.list(prefix).await
+    }
+    async fn exists(&self, key: &str) -> anyhow::Result<bool> {
+        if self.fail_exists.load(Ordering::SeqCst) {
+            anyhow::bail!("storage unavailable");
+        }
+        self.inner.exists(key).await
+    }
 }
 
 async fn harness() -> H {
@@ -196,7 +237,9 @@ async fn harness_with(opts: Opts) -> H {
         up_port = sock.local_addr().unwrap().port();
         reserved = Some(sock);
     }
-    let storage: DynStorage = Arc::new(MemoryStorage::new());
+    let storage = opts
+        .storage
+        .unwrap_or_else(|| Arc::new(MemoryStorage::new()));
     let metrics = Metrics::new();
     let settings = Arc::new(SettingsStore::load(storage.clone()).await.unwrap());
     let index = LruIndex::load_or_rebuild(storage.clone(), opts.max_bytes, metrics.clone())
@@ -922,4 +965,77 @@ async fn prefill_sizing_and_progress() {
         None
     );
     assert!(e.object_size("nope", EPIC, path).await.is_err());
+}
+
+#[tokio::test]
+async fn complete_objects_need_no_metadata_reads() {
+    let probed = Arc::new(Probed::default());
+    let storage: DynStorage = probed.clone();
+    let h = harness_with(Opts {
+        storage: Some(storage.clone()),
+        ..Default::default()
+    })
+    .await;
+    let e = h.engine.clone();
+    e.warm("epic", EPIC, "/obj/200000").await.unwrap();
+    e.object_size("epic", EPIC, "/obj/150000").await.unwrap(); // slice 0 only
+    assert_eq!(e.touch_if_cached("epic", "/obj/200000?sig=1"), Some(200000));
+    assert_eq!(
+        e.touch_if_cached("epic", "/obj/150000"),
+        None,
+        "partly stored"
+    );
+    assert_eq!(e.touch_if_cached("epic", "/missing"), None);
+    h.index.snapshot().await.unwrap();
+
+    // Restarted: a fresh engine (empty meta cache, no slice bits) still knows
+    // the object is complete, and warming it reads no metadata and no upstream.
+    let restarted = |storage: DynStorage| {
+        harness_with(Opts {
+            storage: Some(storage),
+            ..Default::default()
+        })
+    };
+    let h2 = restarted(storage.clone()).await;
+    probed.meta_gets.store(0, Ordering::SeqCst);
+    assert_eq!(
+        h2.engine.touch_if_cached("epic", "/obj/200000"),
+        Some(200000)
+    );
+    let r = h2.engine.warm("epic", EPIC, "/obj/200000").await.unwrap();
+    assert_eq!((r.bytes_downloaded, r.bytes_already_cached), (0, 200000));
+    assert_eq!(probed.meta_gets.load(Ordering::SeqCst), 0);
+    assert_eq!(h2.count("/obj/200000"), 0);
+
+    // Rebuilt from a listing, the size is unknown until meta.json is read back.
+    storage.delete("index/lru.json").await.unwrap();
+    let h3 = restarted(storage.clone()).await;
+    assert_eq!(h3.engine.touch_if_cached("epic", "/obj/200000"), None);
+    h3.engine
+        .object_size("epic", EPIC, "/obj/200000")
+        .await
+        .unwrap();
+    assert_eq!(
+        h3.engine.touch_if_cached("epic", "/obj/200000"),
+        Some(200000)
+    );
+}
+
+#[tokio::test]
+async fn slices_found_in_storage_are_not_counted_as_downloaded() {
+    let probed = Arc::new(Probed::default());
+    let h = harness_with(Opts {
+        storage: Some(probed.clone()),
+        ..Default::default()
+    })
+    .await;
+    let path = "/obj/200000";
+    h.engine.object_size("epic", EPIC, path).await.unwrap(); // stores slice 0
+    // The existence check fails, so slice 0 is read back from storage instead.
+    probed.fail_exists.store(true, Ordering::SeqCst);
+    let r = h.engine.warm("epic", EPIC, path).await.unwrap();
+    assert_eq!(
+        (r.bytes_downloaded, r.bytes_already_cached),
+        (200000 - SLICE, SLICE)
+    );
 }

@@ -1,6 +1,7 @@
 //! One update run: list the selected games, check each (plan + download
-//! estimate), then download them one by one. The record is saved at every
-//! phase/game transition and by a periodic snapshot task.
+//! estimate, counting what the cache already holds), then download the rest
+//! of each game one by one. The record is saved at every phase/game
+//! transition and by a periodic snapshot task.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -75,7 +76,8 @@ impl Run<'_> {
         self.save().await;
     }
 
-    /// Phase 2: plans every game and estimates its download.
+    /// Phase 2: plans every game, estimates its download and counts the objects
+    /// already cached (skipped when downloading).
     async fn check(&self) -> Vec<Option<(GamePlan, Estimate)>> {
         let ids: Vec<String> = self
             .active
@@ -93,7 +95,7 @@ impl Run<'_> {
     }
 
     async fn check_game(&self, i: usize, game_id: &str) -> Option<(GamePlan, Estimate)> {
-        let plan = match self.managed.plan_game(&self.ctx, game_id).await {
+        let mut plan = match self.managed.plan_game(&self.ctx, game_id).await {
             Ok(p) => p,
             Err(e) => {
                 log::warn!("{}/{game_id}: check failed: {e:#}", self.id);
@@ -105,14 +107,16 @@ impl Run<'_> {
                 return None;
             }
         };
-        let est = plan::estimate(self.ctx.prefill.as_ref(), &plan, &self.active.cancel).await;
+        let est = plan::estimate(self.ctx.prefill.as_ref(), &mut plan, &self.active.cancel).await;
         self.set_game(i, |g| {
             g.report.name = plan.name.clone();
             g.report.previous_version = plan.previous_version.clone();
             g.report.current_version = plan.current_version.clone();
             g.report.bytes_downloaded = est.bytes_fetched;
+            g.report.bytes_already_cached = est.bytes_already_cached;
             g.bytes_to_download = Some(est.bytes_to_download);
             g.objects = plan.objects.len() as u64;
+            g.objects_done = est.objects_cached;
             g.status = GameStatus::Queued;
         });
         Some((plan, est))
@@ -137,7 +141,7 @@ impl Run<'_> {
                 &self.active.cancel,
             )
             .await;
-            outcome.add_fetched(est.bytes_fetched);
+            outcome.add_estimate(&est);
             let report = self.managed.finish_game(&self.ctx, &plan, &outcome).await;
             self.mgr
                 .metrics

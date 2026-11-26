@@ -45,6 +45,8 @@ struct Entry {
     bytes: u64,
     /// Size of the object's meta.json (replaced, not added, on rewrite).
     meta_bytes: u64,
+    /// The object's full size, from its meta.json; 0 while unknown.
+    total: u64,
     /// Unix seconds.
     last_access: u64,
     /// Tie-breaker within the same second (not persisted).
@@ -60,6 +62,13 @@ impl Entry {
     /// path simply won't apply to such objects).
     fn set_slice(&mut self, index: u64) -> bool {
         index >= MAX_TRACKED_SLICES || self.slices.set(index)
+    }
+
+    /// Every byte of the object is stored: its slice bytes equal its known size.
+    /// Byte counts survive restarts, unlike the slice bits. A count above the
+    /// size means the entry is off, so it isn't trusted either.
+    fn is_complete(&self) -> bool {
+        self.total > 0 && self.bytes.saturating_sub(self.meta_bytes) == self.total
     }
 }
 
@@ -226,17 +235,48 @@ impl LruIndex {
         self.wrote(inner);
     }
 
-    /// Records the object's meta.json size, replacing any previous value.
-    pub fn record_meta(&self, object_prefix: &str, identifier: &str, bytes: u64) {
+    /// Records the object's meta.json size (replacing any previous value) and
+    /// the object's full size from it.
+    pub fn record_meta(&self, object_prefix: &str, identifier: &str, bytes: u64, total: u64) {
         if self.is_evicting(object_prefix) {
             return;
         }
         let mut inner = self.lock();
         let e = inner.touch(Key::new(object_prefix, identifier));
+        e.total = total;
         let old = std::mem::replace(&mut e.meta_bytes, bytes);
         e.bytes = e.bytes - old.min(e.bytes) + bytes;
         inner.total = inner.total - old.min(inner.total) + bytes;
         self.wrote(inner);
+    }
+
+    /// Records the full size of an indexed object (from meta.json read back
+    /// from storage). Objects that aren't indexed are left alone.
+    pub fn record_total(&self, object_prefix: &str, total: u64) {
+        let mut inner = self.lock();
+        if let Some(e) = inner.objects.get_mut(&Key::find(object_prefix))
+            && e.total != total
+        {
+            e.total = total;
+            drop(inner);
+            self.dirty.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// The object's full size if all of it is known to be stored, marking it
+    /// used; None when it isn't indexed, its size is unknown or bytes are missing.
+    pub fn touch_if_complete(&self, object_prefix: &str) -> Option<u64> {
+        let key = Key::find(object_prefix);
+        let mut inner = self.lock();
+        let total = inner
+            .objects
+            .get(&key)
+            .filter(|e| e.is_complete())
+            .map(|e| e.total)?;
+        inner.touch(key);
+        drop(inner);
+        self.dirty.store(true, Ordering::Relaxed);
+        Some(total)
     }
 
     fn wrote(&self, inner: std::sync::MutexGuard<'_, Inner>) {
@@ -670,7 +710,7 @@ mod tests {
         let idx = index(&storage, None).await;
         let p = "cache/steam/aa/bb/obj";
         assert_eq!(idx.stored_bytes(p), None);
-        idx.record_meta(p, "steam", 300);
+        idx.record_meta(p, "steam", 300, 0);
         assert_eq!(idx.stored_bytes(p), Some(0));
         idx.record_slice(p, "steam", 0, 100);
         idx.record_slice(p, "steam", 1, 50);
@@ -680,14 +720,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_when_stored_bytes_match_size() {
+        let storage: DynStorage = Arc::new(MemoryStorage::new());
+        let idx = index(&storage, None).await;
+        let p = "cache/steam/aa/bb/obj";
+        assert_eq!(idx.touch_if_complete(p), None, "not indexed");
+        idx.record_slice(p, "steam", 0, 100);
+        idx.record_slice(p, "steam", 1, 50);
+        assert_eq!(idx.touch_if_complete(p), None, "size unknown");
+        idx.record_total(p, 150);
+        assert_eq!(idx.touch_if_complete(p), Some(150));
+        idx.record_meta(p, "steam", 300, 250);
+        assert_eq!(idx.touch_if_complete(p), None, "a slice missing");
+        idx.record_slice(p, "steam", 2, 100);
+        assert_eq!(idx.touch_if_complete(p), Some(250));
+        idx.unmark_slice(p, 1, 50);
+        assert_eq!(idx.touch_if_complete(p), None, "slice gone");
+        idx.record_slice(p, "steam", 1, 50);
+        idx.record_write(p, "steam", 10);
+        assert_eq!(idx.touch_if_complete(p), None, "more bytes than the size");
+        idx.record_total("cache/steam/aa/bb/none", 5);
+        assert_eq!(idx.usage().objects, 1, "unindexed objects aren't added");
+    }
+
+    #[tokio::test]
+    async fn complete_objects_are_marked_used() {
+        let storage: DynStorage = Arc::new(MemoryStorage::new());
+        let a = put_object(&storage, "steam", "/a", 100).await;
+        let b = put_object(&storage, "steam", "/b", 100).await;
+        let idx = index(&storage, Some(150)).await;
+        idx.record_total(&a, 100);
+        idx.touch(&b, "steam");
+        assert_eq!(idx.touch_if_complete(&a), Some(100));
+        // 204 > 150: one object goes, and it's b (a was used after it).
+        assert_eq!(idx.pick_victims(150), vec![(b, "steam".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn sizes_survive_a_restart() {
+        let storage: DynStorage = Arc::new(MemoryStorage::new());
+        let p = put_object(&storage, "epic", "/x", 100).await;
+        let idx = index(&storage, None).await;
+        idx.record_total(&p, 100);
+        idx.snapshot().await.unwrap();
+        // Loaded from the snapshot: no slice bits yet, but the size and bytes are there.
+        let idx = index(&storage, None).await;
+        assert!(!idx.has_all_slices(&p, 1));
+        assert_eq!(idx.touch_if_complete(&p), Some(100));
+        idx.reconcile().await.unwrap();
+        assert_eq!(idx.touch_if_complete(&p), Some(100), "kept by reconcile");
+        // Rebuilt from a listing, the size is unknown until meta.json is read.
+        storage.delete(INDEX_KEY).await.unwrap();
+        let idx = index(&storage, None).await;
+        assert_eq!(idx.touch_if_complete(&p), None);
+    }
+
+    #[tokio::test]
     async fn slice_tracking_is_exact() {
         let storage: DynStorage = Arc::new(MemoryStorage::new());
         let idx = index(&storage, None).await;
         let p = "cache/steam/aa/bb/obj";
-        idx.record_meta(p, "steam", 300);
+        idx.record_meta(p, "steam", 300, 0);
         idx.record_slice(p, "steam", 0, 100);
         idx.record_slice(p, "steam", 0, 100); // rewrite: no extra bytes
-        idx.record_meta(p, "steam", 310); // meta rewrite replaces
+        idx.record_meta(p, "steam", 310, 0); // meta rewrite replaces
         assert_eq!(idx.usage().total_bytes, 410);
         // 3 slices, the small last one missing: bytes would suggest "complete" but slices don't.
         idx.record_slice(p, "steam", 1, 100);
@@ -741,7 +837,7 @@ mod tests {
         idx.evicting_prefixes.lock().unwrap().insert(p.to_string());
         idx.record_slice(p, "steam", 0, 100);
         idx.mark_slice(p, "steam", 1);
-        idx.record_meta(p, "steam", 300);
+        idx.record_meta(p, "steam", 300, 0);
         idx.record_write(p, "steam", 10);
         idx.touch(p, "steam");
         assert_eq!(idx.usage().objects, 0);

@@ -552,9 +552,12 @@ async fn managed_updates_flow() {
     h.send(Method::POST, "/api/platforms/fake/managed/run", Value::Null)
         .await;
     let st = wait_for_run(&h).await;
+    let game = &st["last_run"]["games"][0];
+    assert_eq!(game["bytes_already_cached"], 100 * 1024);
+    assert_eq!(game["bytes_downloaded"], 0);
     assert_eq!(
-        st["last_run"]["games"][0]["bytes_already_cached"],
-        100 * 1024
+        (game["files"].clone(), game["objects_done"].clone()),
+        (json!(1), json!(1))
     );
     assert_eq!(st["last_run"]["games"][0]["updated"], false);
     assert_eq!(st["last_run"]["bytes_to_download"], 0);

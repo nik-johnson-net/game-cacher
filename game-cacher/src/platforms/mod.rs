@@ -204,6 +204,12 @@ pub trait Prefill: Send + Sync {
     fn cached_bytes(&self, _identifier: &str, _path_and_query: &str) -> Option<u64> {
         None
     }
+    /// The object's full size when the in-memory index knows all of it is
+    /// stored (no I/O), marking it used like a warm that found it cached.
+    /// None when it isn't, or isn't known to be.
+    fn touch_if_cached(&self, _identifier: &str, _path_and_query: &str) -> Option<u64> {
+        None
+    }
     /// The object's total size: from its stored metadata, else by fetching (and
     /// caching) its first slice upstream. None when upstream gives no cacheable size.
     async fn object_size(

@@ -61,6 +61,7 @@ export type UpdateReport = {
   updated: boolean;
   /** Grows live while the game downloads. */
   bytes_downloaded: number;
+  /** Includes what was found cached when the game was checked. */
   bytes_already_cached: number;
   files: number;
   error: string | null;
@@ -77,6 +78,7 @@ export type GameRun = UpdateReport & {
   /** Estimate, once checked. */
   bytes_to_download: number | null;
   objects: number;
+  /** Includes the objects found cached when the game was checked. */
   objects_done: number;
   /** Live, while downloading. */
   rate_bps: number | null;

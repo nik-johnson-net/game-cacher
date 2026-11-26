@@ -66,7 +66,9 @@ type GamePlanSim = {
   current: string | null;
   failed: boolean;
   toDownload: number;
+  /** Bytes and objects found cached when the game is checked (skipped when downloading). */
   cached: number;
+  cachedObjects: number;
   objects: number;
   downloadMs: number;
 };
@@ -289,6 +291,7 @@ function startRun(m: Managed): ActiveRun {
     const size = g?.size_bytes ?? 2 * GB;
     const updated = i % 2 === 0;
     const toDownload = updated ? Math.round(size * 0.12) : 0;
+    const objects = Math.max(1, Math.round(size / MB));
     return {
       id: sel,
       name: g?.name ?? sel.split("/").pop() ?? sel,
@@ -297,8 +300,10 @@ function startRun(m: Managed): ActiveRun {
       failed: i === 3,
       toDownload,
       cached: size - toDownload,
-      objects: Math.max(1, Math.round(size / MB)),
-      downloadMs: Math.min(20_000, Math.max(1500, (toDownload / RATE) * 1000)),
+      cachedObjects: Math.round((objects * (size - toDownload)) / size),
+      objects,
+      // Fully cached games have nothing to warm and finish almost at once.
+      downloadMs: toDownload === 0 ? 200 : Math.min(20_000, Math.max(1500, (toDownload / RATE) * 1000)),
     };
   });
   return { id: `mock-${++runSeq}`, startedAt: Date.now(), cancelledAt: null, plans };
@@ -350,7 +355,9 @@ function simulate(platformId: string, a: ActiveRun, now: number): UpdateRun {
       previous_version: p.previous,
       current_version: p.current,
       bytes_to_download: p.toDownload,
+      bytes_already_cached: p.cached,
       objects: p.objects,
+      objects_done: p.cachedObjects,
     });
   run.games = a.plans.map((p) => {
     const g = t < clock ? gameRun(p, {}) : t < clock + CHECK_MS ? gameRun(p, { status: "checking" }) : checked(p);
@@ -370,8 +377,7 @@ function simulate(platformId: string, a: ActiveRun, now: number): UpdateRun {
         ...checked(p),
         status: "downloading",
         bytes_downloaded: Math.round(p.toDownload * frac),
-        bytes_already_cached: Math.round(p.cached * frac),
-        objects_done: Math.round(p.objects * frac),
+        objects_done: p.cachedObjects + Math.round((p.objects - p.cachedObjects) * frac),
         rate_bps: rate,
         eta_secs: Math.ceil((end - t) / 1000),
       });
