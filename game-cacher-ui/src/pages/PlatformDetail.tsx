@@ -3,6 +3,7 @@ import { useParams } from "react-router";
 import { Trash2 } from "lucide-react";
 import { ApiError, getPlatform, purgePlatformCache } from "@/api/client";
 import { ManagedSection } from "@/components/managed/managed-section";
+import { EpicClientSetup } from "@/components/platforms/epic-client-setup";
 import { KeyValue, Stat } from "@/components/stat";
 import { AlertBanner } from "@/components/ui/alert-banner";
 import { Badge } from "@/components/ui/badge";
@@ -105,6 +106,8 @@ export default function PlatformDetail() {
           )}
         </CardBody>
       </Card>
+
+      {p.id === "epic" && <EpicClientSetup />}
 
       {p.managed && <ManagedSection platformId={p.id} />}
 
