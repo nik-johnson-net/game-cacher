@@ -1,6 +1,7 @@
 //! `index/lru.json` encoding, written straight from the in-memory map and read
 //! entry by entry, so neither direction holds a second full copy of the index.
-//! Format: `{"version":1,"objects":{"<prefix>":{"identifier","bytes","meta_bytes","last_access"}}}`.
+//! Format: `{"version":1,"objects":{"<prefix>":{"identifier","bytes","meta_bytes","total"?,"last_access"}}}`
+//! (`total`: the object's full size, written once known; older snapshots lack it).
 use std::collections::HashMap;
 use std::fmt;
 
@@ -21,7 +22,13 @@ struct SnapEntry<S> {
     bytes: u64,
     #[serde(default)]
     meta_bytes: u64,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    total: u64,
     last_access: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 struct Objects<'a>(&'a HashMap<Key, Entry>);
@@ -33,6 +40,7 @@ impl Serialize for Objects<'_> {
                 identifier: k.identifier(),
                 bytes: e.bytes,
                 meta_bytes: e.meta_bytes,
+                total: e.total,
                 last_access: e.last_access,
             };
             (k.prefix(), v)
@@ -121,6 +129,7 @@ impl<'de> Visitor<'de> for ObjectsSeed {
             let entry = Entry {
                 bytes: e.bytes,
                 meta_bytes: e.meta_bytes,
+                total: e.total,
                 last_access: e.last_access,
                 ..Default::default()
             };
@@ -148,6 +157,7 @@ mod tests {
         assert_eq!(objects.len(), 2);
         let (k, e) = objects.get_key_value(&Key::find(&p)).unwrap();
         assert_eq!((e.bytes, e.meta_bytes, e.last_access), (100, 2, 7));
+        assert_eq!(e.total, 0, "older snapshots have no sizes");
         assert!(matches!(k, Key::Object { .. }));
         assert_eq!(k.identifier(), "steam");
         let (k, odd) = objects.get_key_value(&Key::find("legacy/odd")).unwrap();
@@ -162,20 +172,27 @@ mod tests {
         let entry = Entry {
             bytes: 42,
             meta_bytes: 3,
+            total: 39,
             last_access: 11,
             ..Default::default()
         };
         objects.insert(Key::new(&p, "epic"), entry.clone());
-        objects.insert(Key::new("odd", "x"), entry);
+        objects.insert(Key::new("odd", "x"), Entry { total: 0, ..entry });
         let json = encode(&objects).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
         assert_eq!(v["version"], 1);
         assert_eq!(v["objects"][&p]["identifier"], "epic");
         assert_eq!(v["objects"][&p]["bytes"], 42);
+        assert_eq!(v["objects"][&p]["total"], 39);
         assert_eq!(v["objects"]["odd"]["identifier"], "x");
+        assert!(
+            v["objects"]["odd"].get("total").is_none(),
+            "unknown: omitted"
+        );
         let back = decode(&json).unwrap();
         let e = &back[&Key::find(&p)];
         assert_eq!((e.bytes, e.meta_bytes, e.last_access), (42, 3, 11));
+        assert_eq!(e.total, 39);
         assert_eq!(back.len(), 2);
     }
 

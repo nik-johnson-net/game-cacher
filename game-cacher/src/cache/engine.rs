@@ -41,7 +41,7 @@ pub struct CacheEngine {
     read_ahead: usize,
     metas: DashMap<String, Arc<Meta>>,
     probes: DashMap<String, Arc<OnceCell<ProbeShared>>>,
-    slices: DashMap<String, Arc<OnceCell<Result<Bytes, CacheError>>>>,
+    slices: DashMap<String, Arc<OnceCell<SliceShared>>>,
 }
 
 pub struct EngineDeps {
@@ -122,6 +122,10 @@ impl Target {
 /// Probe result shared with coalesced waiters: meta (+ slice 0 if just fetched),
 /// or None when the leader got a response that can't be shared.
 type ProbeShared = Result<Option<(Arc<Meta>, Option<Bytes>)>, CacheError>;
+
+/// Slice fetch result shared with coalesced waiters: the slice and whether the
+/// leader found it in storage.
+type SliceShared = Result<(Bytes, bool), CacheError>;
 
 enum ProbeOutcome {
     Stored(Arc<Meta>, Bytes),
@@ -347,6 +351,7 @@ impl CacheEngine {
         };
         match serde_json::from_slice::<Meta>(&bytes) {
             Ok(m) if m.is_valid() => {
+                self.index.record_total(&t.prefix, m.total_size);
                 let m = Arc::new(m);
                 self.cache_meta(&t.prefix, m.clone());
                 Some(m)
@@ -362,7 +367,9 @@ impl CacheEngine {
         let json = serde_json::to_vec(meta.as_ref()).unwrap_or_default();
         let len = json.len() as u64;
         match self.storage.put(&t.key.meta_key(), Bytes::from(json)).await {
-            Ok(()) => self.index.record_meta(&t.prefix, t.identifier(), len),
+            Ok(()) => self
+                .index
+                .record_meta(&t.prefix, t.identifier(), len, meta.total_size),
             Err(e) => log::warn!("storing meta for {}: {e:#}", t.prefix),
         }
         self.cache_meta(&t.prefix, meta.clone());
@@ -513,14 +520,14 @@ impl CacheEngine {
             .get_or_init(|| async {
                 // A previous leader may have stored it since our check.
                 if let Some(b) = self.cached_slice(t, meta, index).await {
-                    return Ok(b);
+                    return Ok((b, true));
                 }
-                self.fetch_slice(t, meta, index).await
+                self.fetch_slice(t, meta, index).await.map(|b| (b, false))
             })
             .await
             .clone();
         self.slices.remove_if(&key, |_, v| Arc::ptr_eq(v, &cell));
-        res.map(|b| (b, false))
+        res
     }
 
     /// True if the slice is stored (touches the object).
@@ -606,9 +613,11 @@ impl CacheEngine {
                 if self.slice_stored(t, meta, i).await {
                     return Ok((meta.slice_len(i), true));
                 }
+                // Found in storage after all (e.g. the existence check failed):
+                // still already cached, not downloaded.
                 self.slice(t, meta, i)
                     .await
-                    .map(|(b, _)| (b.len() as u64, false))
+                    .map(|(b, stored)| (b.len() as u64, stored))
             })
             .buffer_unordered(WARM_PARALLELISM);
         let mut cached = 0;
@@ -757,6 +766,13 @@ impl Prefill for CacheEngine {
             log::debug!("prefill: {path_and_query} bypasses the cache, skipping warm");
             return Ok(WarmResult::default());
         }
+        // Complete per the index: no metadata read needed.
+        if let Some(total) = self.index.touch_if_complete(&t.prefix) {
+            return Ok(WarmResult {
+                bytes_downloaded: 0,
+                bytes_already_cached: total,
+            });
+        }
         let mut r = WarmResult::default();
         let mut downloaded = |n: u64| {
             r.bytes_downloaded += n;
@@ -801,6 +817,11 @@ impl Prefill for CacheEngine {
     fn cached_bytes(&self, identifier: &str, path_and_query: &str) -> Option<u64> {
         let key = ObjectKey::new(identifier, path_and_query);
         self.index.stored_bytes(&key.prefix())
+    }
+
+    fn touch_if_cached(&self, identifier: &str, path_and_query: &str) -> Option<u64> {
+        let key = ObjectKey::new(identifier, path_and_query);
+        self.index.touch_if_complete(&key.prefix())
     }
 
     async fn object_size(

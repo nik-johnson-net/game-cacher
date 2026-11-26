@@ -356,12 +356,16 @@ async fn steam_select_run_purge_repair() {
         assert_eq!(h.chunk_status(sha).await, "HIT");
     }
 
-    // Unchanged build and warm cache: verified, nothing downloaded.
+    // Unchanged build and warm cache: found cached when checked, nothing downloaded.
     let r = h.run_update().await;
     assert_eq!(r["error"], Value::Null);
     assert_eq!(r["updated"], false);
     assert_eq!(r["bytes_downloaded"], 0);
     assert_eq!(r["bytes_already_cached"], total);
+    assert_eq!(
+        (r["files"].clone(), r["objects_done"].clone()),
+        (json!(2), json!(2))
+    );
 
     // Purge, then the next run repairs the cache although the build is unchanged.
     let (s, _) = h

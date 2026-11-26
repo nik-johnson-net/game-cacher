@@ -72,6 +72,7 @@ pub struct GameRun {
     pub bytes_to_download: Option<u64>,
     #[serde(default)]
     pub objects: u64,
+    /// Objects finished: found cached when checked, or warmed (or failed) since.
     #[serde(default)]
     pub objects_done: u64,
     /// Live only (never read back from storage).

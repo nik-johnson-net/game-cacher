@@ -19,6 +19,8 @@ pub struct PlannedObject {
     pub size: Option<u64>,
     /// Index into `GamePlan::groups`.
     pub group: u16,
+    /// Found complete in the cache by `estimate`: `execute` skips it.
+    pub cached: bool,
 }
 
 /// Objects whose failures are reported together (e.g. one Steam depot).
@@ -85,7 +87,12 @@ impl GamePlan {
             (group as usize) < self.groups.len(),
             "object group {group} not declared"
         );
-        self.objects.push(PlannedObject { path, size, group });
+        self.objects.push(PlannedObject {
+            path,
+            size,
+            group,
+            cached: false,
+        });
     }
 
     pub fn payload<T: 'static>(&self) -> Option<&T> {
@@ -118,11 +125,15 @@ pub struct Outcome {
 }
 
 impl Outcome {
-    /// Moves the bytes `estimate` fetched from "already cached" to "downloaded":
-    /// `execute` found them cached, but this run downloaded them.
-    pub fn add_fetched(&mut self, fetched: u64) {
-        self.bytes_downloaded += fetched;
-        self.bytes_already_cached = self.bytes_already_cached.saturating_sub(fetched);
+    /// Folds in what `estimate` found: the objects it found cached (skipped by
+    /// `execute`) count as warmed and already cached, and the bytes it fetched
+    /// while sizing move from "already cached" to "downloaded" (`execute`
+    /// found them cached, but this run downloaded them).
+    pub fn add_estimate(&mut self, est: &Estimate) {
+        self.files += est.objects_cached;
+        self.bytes_already_cached += est.bytes_already_cached;
+        self.bytes_downloaded += est.bytes_fetched;
+        self.bytes_already_cached = self.bytes_already_cached.saturating_sub(est.bytes_fetched);
     }
 
     /// True if every object of group `g` that was attempted succeeded and the run wasn't cancelled.
@@ -177,30 +188,56 @@ pub struct Estimate {
     /// Bytes fetched while sizing objects with no listed size (their first slice);
     /// `execute` later reports them as already cached.
     pub bytes_fetched: u64,
+    /// Objects found complete in the cache (marked `cached`), and their bytes.
+    pub objects_cached: u64,
+    pub bytes_already_cached: u64,
 }
 
 /// Concurrent size lookups for objects with no listed size.
 const SIZE_CONCURRENCY: usize = 16;
 
-/// Estimates what `plan` still has to download: each object's listed size minus
-/// the bytes the in-memory index holds for it. Objects with no listed size are
-/// sized through `Prefill::object_size` (stored metadata, else a first-slice
-/// fetch upstream); objects that can't be sized count as nothing to download.
+/// Estimates what `plan` still has to download. Objects the in-memory index
+/// holds in full are marked `cached` (and marked used) so `execute` skips them.
+/// Others count their listed size minus the bytes stored; those with no listed
+/// size are sized through `Prefill::object_size` (stored metadata, else a
+/// first-slice fetch upstream); objects that can't be sized count as nothing
+/// to download.
 pub async fn estimate(
     prefill: &dyn Prefill,
-    plan: &GamePlan,
+    plan: &mut GamePlan,
     cancel: &CancellationToken,
 ) -> Estimate {
     let mut est = Estimate::default();
-    let mut unknown = Vec::new();
-    for (i, o) in plan.objects.iter().enumerate() {
-        let cached = prefill.cached_bytes(plan.identifier, &o.path).unwrap_or(0);
+    let mut unlisted = Vec::new();
+    let id = plan.identifier;
+    for (i, o) in plan.objects.iter_mut().enumerate() {
+        if let Some(total) = prefill.touch_if_cached(id, &o.path) {
+            o.cached = true;
+            est.objects_cached += 1;
+            est.bytes_already_cached += total;
+            continue;
+        }
+        let stored = prefill.cached_bytes(id, &o.path).unwrap_or(0);
         match o.size {
-            Some(size) => est.bytes_to_download += size.saturating_sub(cached),
-            None => unknown.push((i, cached)),
+            Some(size) => est.bytes_to_download += size.saturating_sub(stored),
+            None => unlisted.push((i, stored)),
         }
     }
-    let mut sizes = stream::iter(unknown)
+    let (missing, fetched) = size_unlisted(prefill, plan, unlisted, cancel).await;
+    est.bytes_to_download += missing;
+    est.bytes_fetched += fetched;
+    est
+}
+
+/// Sizes objects with no listed size, given with the bytes stored for each:
+/// (bytes missing, bytes fetched while sizing).
+async fn size_unlisted(
+    prefill: &dyn Prefill,
+    plan: &GamePlan,
+    objects: Vec<(usize, u64)>,
+    cancel: &CancellationToken,
+) -> (u64, u64) {
+    let mut sizes = stream::iter(objects)
         .map(|(i, before)| async move {
             let o = &plan.objects[i];
             if cancel.is_cancelled() {
@@ -227,13 +264,14 @@ pub async fn estimate(
             }
         })
         .buffer_unordered(SIZE_CONCURRENCY);
+    let (mut missing, mut fetched) = (0, 0);
     while let Some(r) = sizes.next().await {
-        if let Some((missing, fetched)) = r {
-            est.bytes_to_download += missing;
-            est.bytes_fetched += fetched;
+        if let Some((m, f)) = r {
+            missing += m;
+            fetched += f;
         }
     }
-    est
+    (missing, fetched)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -262,9 +300,10 @@ impl Tally {
     }
 }
 
-/// Warms every object of `plan`, `plan.concurrency` at a time. Object failures
-/// are tallied per group, never fatal. On cancellation no new object starts and
-/// in-flight warms are dropped.
+/// Warms every object of `plan` not marked `cached`, `plan.concurrency` at a
+/// time (the outcome covers only those; see `Outcome::add_estimate`). Object
+/// failures are tallied per group, never fatal. On cancellation no new object
+/// starts and in-flight warms are dropped.
 pub async fn execute(
     prefill: &dyn Prefill,
     plan: &GamePlan,
@@ -306,7 +345,7 @@ pub async fn execute(
     out
 }
 
-/// Each object's warm result, or None when cancellation skipped or dropped it.
+/// Each uncached object's warm result, or None when cancellation skipped or dropped it.
 fn warm_all<'a>(
     prefill: &'a dyn Prefill,
     plan: &'a GamePlan,
@@ -315,7 +354,7 @@ fn warm_all<'a>(
 ) -> impl Stream<Item = (&'a PlannedObject, Option<Result<WarmResult>>)> + Send + 'a {
     // Indices rather than references: closures over `&PlannedObject` trip the
     // compiler's higher-ranked lifetime checks inside `Send` futures.
-    stream::iter(0..plan.objects.len())
+    stream::iter((0..plan.objects.len()).filter(move |&i| !plan.objects[i].cached))
         .map(move |i| async move {
             let o = &plan.objects[i];
             if cancel.is_cancelled() {
@@ -351,6 +390,10 @@ mod tests {
         cancel_on_warm: Option<CancellationToken>,
         /// path → stored bytes (the index).
         cached: Mutex<std::collections::HashMap<String, u64>>,
+        /// path → full size of objects the index holds in full.
+        complete: std::collections::HashMap<String, u64>,
+        /// Complete objects marked used, in order.
+        touched: Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -378,6 +421,12 @@ mod tests {
         }
         fn cached_bytes(&self, _: &str, path: &str) -> Option<u64> {
             self.cached.lock().unwrap().get(path).copied()
+        }
+        fn touch_if_cached(&self, id: &str, path: &str) -> Option<u64> {
+            assert_eq!(id, "test");
+            let total = self.complete.get(path).copied()?;
+            self.touched.lock().unwrap().push(path.into());
+            Some(total)
         }
         /// "/sized<N>" objects are N bytes; sizing stores a 10-byte first slice.
         async fn object_size(&self, _: &str, _: &str, path: &str) -> Result<Option<u64>> {
@@ -500,30 +549,103 @@ mod tests {
         p.add("/sized50".into(), None, 0); // 50 missing, 10 fetched
         p.add("/unknown".into(), None, 0); // can't be sized
         p.add("/bad".into(), None, 0); // sizing fails
-        let est = estimate(&prefill, &p, &CancellationToken::new()).await;
+        let est = estimate(&prefill, &mut p, &CancellationToken::new()).await;
         assert_eq!(
             est,
             Estimate {
                 bytes_to_download: 70 + 5 + 60 + 50,
                 bytes_fetched: 10,
+                ..Default::default()
             }
         );
+        assert!(p.objects.iter().all(|o| !o.cached));
 
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let est = estimate(&prefill, &plan(&[("/sized70", 0)]), &cancel).await;
+        let est = estimate(&prefill, &mut plan(&[("/sized70", 0)]), &cancel).await;
         assert_eq!(est, Estimate::default());
     }
 
+    #[tokio::test]
+    async fn estimate_marks_complete_objects_cached() {
+        let prefill = MockPrefill {
+            // "/sized50" has no listed size: complete, so it isn't probed.
+            complete: [("/whole", 100), ("/sized50", 50)]
+                .map(|(p, n)| (p.to_string(), n))
+                .into(),
+            ..Default::default()
+        };
+        prefill.cached.lock().unwrap().insert("/part".into(), 30);
+        let mut p = plan(&[]);
+        p.add("/whole".into(), Some(90), 0); // listed size is ignored when complete
+        p.add("/part".into(), Some(100), 0);
+        p.add("/sized50".into(), None, 1);
+        let est = estimate(&prefill, &mut p, &CancellationToken::new()).await;
+        assert_eq!(
+            est,
+            Estimate {
+                bytes_to_download: 70,
+                bytes_fetched: 0,
+                objects_cached: 2,
+                bytes_already_cached: 150,
+            }
+        );
+        let cached: Vec<bool> = p.objects.iter().map(|o| o.cached).collect();
+        assert_eq!(cached, vec![true, false, true]);
+        assert_eq!(*prefill.touched.lock().unwrap(), vec!["/whole", "/sized50"]);
+        assert_eq!(
+            prefill.cached.lock().unwrap().get("/sized50"),
+            None,
+            "not probed"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_skips_cached_objects() {
+        let prefill = MockPrefill::default();
+        let mut p = plan(&[("/a", 0), ("/b", 0), ("/bad", 1)]);
+        p.objects[1].cached = true;
+        p.objects[2].cached = true;
+        let count = Count::default();
+        let mut out = execute(&prefill, &p, &count, &CancellationToken::new()).await;
+        assert_eq!(*prefill.warmed.lock().unwrap(), vec!["/a".to_string()]);
+        assert_eq!(count.1.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            (out.files, out.bytes_downloaded, out.bytes_already_cached),
+            (1, 10, 1)
+        );
+        assert!(out.succeeded(&p), "skipped objects don't fail their group");
+
+        out.add_estimate(&Estimate {
+            bytes_to_download: 10,
+            bytes_fetched: 0,
+            objects_cached: 2,
+            bytes_already_cached: 500,
+        });
+        assert_eq!(
+            (out.files, out.bytes_downloaded, out.bytes_already_cached),
+            (3, 10, 501)
+        );
+        let r = out.report(&p);
+        assert_eq!((r.files, r.bytes_already_cached), (3, 501));
+    }
+
     #[test]
-    fn fetched_bytes_move_to_downloaded() {
+    fn estimate_folds_into_the_outcome() {
         let mut out = Outcome {
             bytes_downloaded: 5,
             bytes_already_cached: 8,
+            files: 1,
             ..Default::default()
         };
-        out.add_fetched(10);
+        // Fetched while sizing: execute found those bytes cached, but this run
+        // downloaded them.
+        out.add_estimate(&Estimate {
+            bytes_fetched: 10,
+            ..Default::default()
+        });
         assert_eq!((out.bytes_downloaded, out.bytes_already_cached), (15, 0));
+        assert_eq!(out.files, 1);
     }
 
     #[tokio::test]
